@@ -18,7 +18,7 @@ from candidate_agent.config import Settings
 
 logger = structlog.get_logger(__name__)
 
-# Tools routed exclusively to the Job Application sub-agent
+# Tools routed exclusively to the v1 Job Application sub-agent
 APP_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "getApplicationStatus",
@@ -27,6 +27,28 @@ APP_TOOL_NAMES: frozenset[str] = frozenset(
         "getNextSteps",
         "getStageDuration",
         "getInterviewFeedback",
+    }
+)
+
+# Tools available to the v2 post_apply_assistant (profile + application + job + assessment)
+POST_APPLY_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        # Profile
+        "getCandidateProfile",
+        "getSkillsGap",
+        # Application
+        "getApplicationStatus",
+        "getApplicationsByCandidate",
+        "getCandidateJourney",
+        "getNextSteps",
+        "getStageDuration",
+        "getInterviewFeedback",
+        # Job enrichment — application.jobId → full job details (title, location, assessment codes)
+        "getJob",
+        # Assessment
+        "getAssessmentResults",
+        "getAssessmentByType",
+        "compareToPercentile",
     }
 )
 
@@ -60,6 +82,7 @@ class MCPToolRegistry:
     client: MultiServerMCPClient
     all_tools: list[BaseTool] = field(default_factory=list)
     app_tools: list[BaseTool] = field(default_factory=list)
+    post_apply_tools: list[BaseTool] = field(default_factory=list)
 
     # Static knowledge resources — embedded into agent system prompts
     workflow_states_json: str = ""      # ats://workflow/application-states
@@ -92,12 +115,15 @@ async def init_registry(settings: Settings) -> MCPToolRegistry:
     log.info("loading_mcp_tools")
     all_tools: list[BaseTool] = await client.get_tools()
     app_tools = [t for t in all_tools if t.name in APP_TOOL_NAMES]
+    post_apply_tools = [t for t in all_tools if t.name in POST_APPLY_TOOL_NAMES]
     log.info(
         "mcp_tools_loaded",
         total=len(all_tools),
         app_agent_tools=len(app_tools),
+        post_apply_tools=len(post_apply_tools),
         all_tool_names=[t.name for t in all_tools],
         app_tool_names=[t.name for t in app_tools],
+        post_apply_tool_names=[t.name for t in post_apply_tools],
     )
 
     # ── Load static knowledge resources for system prompt enrichment ──────────
@@ -121,6 +147,7 @@ async def init_registry(settings: Settings) -> MCPToolRegistry:
         client=client,
         all_tools=all_tools,
         app_tools=app_tools,
+        post_apply_tools=post_apply_tools,
         workflow_states_json=workflow_states_json,
         assessment_types_json=assessment_types_json,
         candidate_schema_json=candidate_schema_json,

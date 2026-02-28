@@ -45,3 +45,33 @@ class HealthResponse(BaseModel):
     mcp_connected: bool
     llm_model: str
     version: str = "1.0.0"
+
+
+# ── v2 route schemas ──────────────────────────────────────────────────────────
+
+class V2InvokeRequest(BaseModel):
+    message: str = Field(..., description="User message to the agent")
+    candidate_id: str = Field(
+        default="",
+        description="Candidate ID the assistant is acting on behalf of (e.g. C001)",
+    )
+    application_id: str = Field(
+        default="",
+        description="Optional application ID when the query is about a specific application",
+    )
+    thread_id: str = Field(
+        default_factory=lambda: str(uuid4()),
+        description="Conversation thread ID for multi-turn context. Auto-generated if omitted.",
+    )
+    correlation_id: str = Field(
+        default_factory=lambda: str(uuid4()),
+        description="Request trace ID for observability. Auto-generated if omitted.",
+    )
+
+
+class V2StreamRequest(BaseModel):
+    message: str = Field(..., description="User message to the agent")
+    candidate_id: str = Field(default="")
+    application_id: str = Field(default="")
+    thread_id: str = Field(default_factory=lambda: str(uuid4()))
+    correlation_id: str = Field(default_factory=lambda: str(uuid4()))

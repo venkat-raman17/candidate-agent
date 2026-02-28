@@ -10,8 +10,9 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 
-from candidate_agent.agents.graph import build_graph
+from candidate_agent.agents.graph import build_graph, build_v2_graph
 from candidate_agent.api.routes.agent import router as agent_router
+from candidate_agent.api.routes.agent_v2 import router as agent_v2_router
 from candidate_agent.api.routes.health import router as health_router
 from candidate_agent.config import settings
 from candidate_agent.logging_setup import configure_logging
@@ -38,18 +39,23 @@ async def lifespan(app: FastAPI):
         app_port=settings.app_port,
     )
 
-    # Load MCP tools from candidate-mcp server
+    # Load MCP tools and static resources from candidate-mcp server
     registry = await init_registry(settings)
 
-    # Compile the multi-agent LangGraph
+    # Compile both graphs — they share the same registry and LLM config
     graph = build_graph(registry, settings)
+    v2_graph = build_v2_graph(registry, settings)
 
     # Attach to app state so dependencies can access them
     app.state.mcp_registry = registry
     app.state.graph = graph
+    app.state.v2_graph = v2_graph
     app.state.settings = settings
 
-    logger.info("startup_complete")
+    logger.info(
+        "startup_complete",
+        post_apply_tools=len(registry.post_apply_tools),
+    )
     yield
     logger.info("shutdown")
 
@@ -57,12 +63,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Candidate Agent",
     description=(
-        "LangGraph multi-agent system exposing ATS candidate domain intelligence "
-        "via a Candidate Primary Agent and a Job Application Status sub-agent."
+        "LangGraph multi-agent system for the ATS candidate domain. "
+        "v1: Candidate Primary + Job Application sub-agent. "
+        "v2: v2 Primary router + Post-Apply Assistant (candidate-facing)."
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 app.include_router(agent_router, prefix="/api/v1/agent")
+app.include_router(agent_v2_router, prefix="/api/v2/agent")
 app.include_router(health_router)
