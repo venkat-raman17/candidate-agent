@@ -1,14 +1,19 @@
 # candidate-agent
 
-A **production-grade LLM agent** for the ATS candidate domain, built with Python, FastAPI, and LangGraph. It connects to [`candidate-mcp`](../candidate-mcp) via the Model Context Protocol and exposes a multi-agent workflow through REST and Server-Sent Events (SSE) endpoints.
+A **production-grade LLM agent** for the ATS candidate domain, built with Python, FastAPI, and LangGraph. It connects to [`candidate-mcp`](../candidate-mcp) via the Model Context Protocol and exposes two independent multi-agent workflows through REST and Server-Sent Events (SSE) endpoints.
 
-The agent is designed around two specialists that collaborate: a **Candidate Primary Agent** that handles the broad domain (profiles, jobs, assessments, schemas) and a **Job Application Agent** that specialises in the post-application journey (status, timelines, next steps, interview feedback). The primary agent routes to the specialist automatically when the query calls for it.
+The service runs **two parallel graphs** in a single process:
+
+| Version | Route prefix | Agents | Use case |
+|---|---|---|---|
+| **v1** | `/api/v1/agent/` | Candidate Primary + Job Application Agent | Internal ATS domain queries, developer assistants, HR ops |
+| **v2** | `/api/v2/agent/` | v2 Primary Router + Post-Apply Assistant | Candidate-facing: profile, applications, assessments |
 
 ---
 
 ## Architecture
 
-### Multi-Agent Graph
+### v1 Graph — Candidate Primary + Job Application Agent
 
 ```mermaid
 flowchart TD
@@ -23,6 +28,21 @@ flowchart TD
     JAA -->|"Completes journey narrative"| END_NODE
 ```
 
+### v2 Graph — v2 Primary Router + Post-Apply Assistant
+
+```mermaid
+flowchart TD
+    START2(["START"])
+    V2PA["v2 Primary Assistant\n─────────────────────────\nThin router — handoff tool only\nRoutes all domain queries to specialist"]
+    PAA["Post-Apply Assistant\n─────────────────────────\n12 MCP tools across 4 domains\nProfile · Application · Job · Assessment\nSpeaks directly to the candidate"]
+    END2(["END"])
+
+    START2 --> V2PA
+    V2PA -->|"Domain query → route immediately"| PAA
+    V2PA -->|"Trivial meta question"| END2
+    PAA --> END2
+```
+
 ### System Components
 
 ```mermaid
@@ -32,9 +52,11 @@ flowchart LR
     end
 
     subgraph "candidate-agent  :8000"
-        API["FastAPI\n────────────\nPOST /api/v1/agent/invoke\nPOST /api/v1/agent/stream\nGET  /health"]
-        GRAPH["LangGraph\nStateGraph"]
-        REG["MCPToolRegistry\n────────────\nTools loaded at startup\nSchemas embedded in prompts"]
+        V1API["v1 Routes\n────────────\nPOST /api/v1/agent/invoke\nPOST /api/v1/agent/stream"]
+        V2API["v2 Routes\n────────────\nPOST /api/v2/agent/invoke\nPOST /api/v2/agent/stream"]
+        V1G["v1 LangGraph\nStateGraph"]
+        V2G["v2 LangGraph\nStateGraph"]
+        REG["MCPToolRegistry\n────────────\nTools + Schemas\nloaded at startup"]
         LLM["LLM\n(Anthropic Claude\nor Local via Ollama)"]
     end
 
@@ -42,17 +64,18 @@ flowchart LR
         MCP["MCP Server\n(Spring AI · Java)"]
     end
 
-    CL -->|"REST / SSE"| API
-    API --> GRAPH
-    GRAPH --> LLM
-    GRAPH -->|"tool calls\n(MCP streamable HTTP)"| MCP
-    REG -->|"loaded at startup"| GRAPH
+    CL -->|"REST / SSE"| V1API & V2API
+    V1API --> V1G
+    V2API --> V2G
+    V1G & V2G --> LLM
+    V1G & V2G -->|"tool calls\n(MCP streamable HTTP)"| MCP
+    REG -->|"loaded at startup"| V1G & V2G
     MCP -->|"tools + schemas"| REG
 ```
 
 ---
 
-## How Schema Resources Power the Agent
+## How Schema Resources Power the Agents
 
 At startup, `candidate-agent` fetches static JSON Schema resources from `candidate-mcp`
 and embeds them directly into the LLM system prompts before any conversation begins.
@@ -68,8 +91,8 @@ flowchart LR
 
     subgraph "candidate-agent startup"
         REG["MCPToolRegistry\ninit_registry()"]
-        PB["Prompt Builder\nbuild_primary_prompt()\nbuild_job_app_prompt()"]
-        SYS["LLM System Prompt\n(baked in before first call)"]
+        PB["Prompt Builders\nbuild_primary_prompt()\nbuild_job_app_prompt()\nbuild_v2_primary_prompt()\nbuild_post_apply_prompt()"]
+        SYS["LLM System Prompts\n(baked in before first call)"]
     end
 
     S1 & S2 & S3 & S4 -->|"fetched once\nover MCP"| REG
@@ -77,17 +100,19 @@ flowchart LR
     PB --> SYS
 ```
 
-This means the LLM knows the exact shape, field names, enums, and valid state
-transitions of every ATS entity **before** its first tool call — improving accuracy
-and eliminating hallucinated field names with no runtime overhead.
+The LLM knows the exact shape, field names, enums, and valid state transitions of
+every ATS entity **before** its first tool call — improving accuracy and eliminating
+hallucinated field names at zero runtime cost.
 
 ---
 
 ## API Endpoints
 
-### `POST /api/v1/agent/invoke`
+### v1 — Internal / Developer
 
-Runs the full agent workflow synchronously and returns the final response as JSON.
+#### `POST /api/v1/agent/invoke`
+
+Runs the v1 graph synchronously.
 
 **Request**
 
@@ -105,15 +130,71 @@ Runs the full agent workflow synchronously and returns the final response as JSO
 | `response` | Final agent answer |
 | `agent_used` | `"candidate_primary"` or `"job_application_agent"` |
 | `tool_calls` | Names of MCP tools called during the run |
-| `thread_id` | Thread ID (use in subsequent turns to maintain context) |
+| `thread_id` | Thread ID for subsequent turns |
 | `correlation_id` | Trace ID for log correlation |
+
+#### `POST /api/v1/agent/stream`
+
+Same as v1 `/invoke` but streams as **Server-Sent Events**.
 
 ---
 
-### `POST /api/v1/agent/stream`
+### v2 — Candidate-Facing
 
-Same as `/invoke` but streams the response as **Server-Sent Events**. Suitable for
-real-time UIs.
+#### `POST /api/v2/agent/invoke`
+
+Runs the v2 graph synchronously. Routes through `v2_primary_assistant` →
+`post_apply_assistant`.
+
+**Request**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `message` | string | Yes | Candidate's message |
+| `candidate_id` | string | **Yes** | Candidate identity — injected into LLM context |
+| `application_id` | string | No | Scope the query to a specific application. When omitted, the assistant retrieves all applications for the candidate. |
+| `thread_id` | string | No | Conversation thread ID (auto-generated if omitted) |
+| `correlation_id` | string | No | Trace ID (auto-generated if omitted) |
+
+**Response**
+
+| Field | Description |
+|---|---|
+| `response` | Candidate-facing answer in plain language |
+| `agent_used` | `"v2_primary_assistant"` or `"post_apply_assistant"` |
+| `tool_calls` | Names of MCP tools called |
+| `thread_id` | Thread ID for subsequent turns |
+| `correlation_id` | Trace ID |
+
+**Example — profile query (no application_id)**
+
+```bash
+curl -s -X POST http://localhost:8000/api/v2/agent/invoke \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "Show me my candidate profile.",
+    "candidate_id": "C002",
+    "thread_id": "session-001"
+  }'
+```
+
+**Example — specific application query**
+
+```bash
+curl -s -X POST http://localhost:8000/api/v2/agent/invoke \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "Where does my application stand?",
+    "candidate_id": "C001",
+    "application_id": "A001",
+    "thread_id": "session-002"
+  }'
+```
+
+#### `POST /api/v2/agent/stream`
+
+Same as v2 `/invoke` but streams as Server-Sent Events. Emits a `handoff` event
+when `post_apply_assistant` takes over.
 
 **SSE Event Types**
 
@@ -121,13 +202,15 @@ real-time UIs.
 |---|---|---|
 | `token` | `{content: str}` | LLM output token |
 | `tool_call` | `{name: str}` | MCP tool invocation started |
-| `handoff` | `{from: str, to: str}` | Agent routing decision |
+| `handoff` | `{from: str, to: str}` | Routing from v2 primary → post_apply |
 | `done` | `{active_agent: str, tool_calls: [str]}` | Stream complete |
 | `error` | `{detail: str}` | Unhandled error |
 
 ---
 
-### `GET /health`
+### Health
+
+#### `GET /health`
 
 Liveness and MCP connectivity check.
 
@@ -227,26 +310,62 @@ The agent remembers previous messages within the thread.
 
 ```bash
 # Turn 1
-curl -s -X POST http://localhost:8000/api/v1/agent/invoke \
+curl -s -X POST http://localhost:8000/api/v2/agent/invoke \
   -H "Content-Type: application/json" \
-  -d '{"message": "Tell me about candidate C001.", "thread_id": "my-session"}'
+  -d '{"message": "What is my application status?", "candidate_id": "C001", "application_id": "A001", "thread_id": "my-session"}'
 
 # Turn 2 — agent has context from turn 1
-curl -s -X POST http://localhost:8000/api/v1/agent/invoke \
+curl -s -X POST http://localhost:8000/api/v2/agent/invoke \
   -H "Content-Type: application/json" \
-  -d '{"message": "What jobs match their skills?", "thread_id": "my-session"}'
+  -d '{"message": "What should I prepare for next?", "candidate_id": "C001", "thread_id": "my-session"}'
 ```
 
 ---
 
 ## Running Tests
 
-Tests are integration tests — they require both `candidate-mcp` (`:8081`) and a valid
-`ANTHROPIC_API_KEY` (or `LOCAL_LLM=true`) to be configured.
+### Integration Tests (pytest)
+
+Require both `candidate-mcp` (`:8081`) and a valid `ANTHROPIC_API_KEY`.
 
 ```bash
 uv run pytest tests/ -v
 ```
+
+### v2 Scenario Tests
+
+A standalone script that exercises all 14 v2 use cases against a live server and
+reports pass/fail with response previews.
+
+```bash
+# Run all 14 scenarios
+.venv/bin/python tests/test_v2_scenarios.py
+
+# Run a single scenario
+.venv/bin/python tests/test_v2_scenarios.py --scenario 3
+
+# Against a non-default host
+.venv/bin/python tests/test_v2_scenarios.py --base-url http://staging:8000
+```
+
+Scenarios covered:
+
+| # | Group | Candidate | Scenario |
+|---|---|---|---|
+| 1 | Profile | C002 | View candidate profile |
+| 2 | Profile | C001 | Skills gap vs unapplied role (J002) |
+| 3 | Application Status | C001 / A001 | FINAL_INTERVIEW status |
+| 4 | Application Status | C004 / A004 | OFFER_EXTENDED — offer details |
+| 5 | Application Status | C001 / A006 | REJECTED — constructive tone |
+| 6 | All Applications | C001 | Full history (A001 + A006), no application_id |
+| 7 | All Applications | C006 | Journey narrative, no application_id |
+| 8 | Assessments | C004 / A004 | All 3 assessments (top scorer) |
+| 9 | Assessments | C002 / A002 | Percentile comparison (94th) |
+| 10 | Next Steps | C002 / A002 | PHONE_INTERVIEW prep guidance |
+| 11 | Next Steps | C006 / A007 | SLA / stage duration check |
+| 12 | Streaming | C003 / A003 | SSE stream — status + next steps |
+| 13 | Edge Cases | C005 / A005 | HIRED candidate — journey summary |
+| 14 | Edge Cases | C001 / A001 | Interview feedback (3 rounds) |
 
 ---
 
@@ -254,26 +373,29 @@ uv run pytest tests/ -v
 
 ```
 src/candidate_agent/
-├── main.py                   FastAPI app and lifespan (MCP init, graph compile)
+├── main.py                   FastAPI app and lifespan (MCP init, both graphs compiled)
 ├── config.py                 Pydantic Settings — reads from .env
 ├── logging_setup.py          structlog JSON configuration
 ├── agents/
-│   ├── graph.py              LangGraph StateGraph wiring
-│   ├── state.py              CandidateAgentState schema
-│   ├── prompts.py            System prompt factory functions
-│   └── llm.py                LLM factory (Anthropic ↔ local)
+│   ├── graph.py              v1 build_graph() + v2 build_v2_graph() + context injection
+│   ├── state.py              CandidateAgentState (v1) · PostApplyAgentState (v2)
+│   ├── prompts.py            System prompt factory functions for all four agents
+│   └── llm.py               LLM factory (Anthropic ↔ local)
 ├── mcp/
-│   └── client.py             MCPToolRegistry — tool loading and schema fetching
+│   └── client.py            MCPToolRegistry — tool loading, schema fetching,
+│                            app_tools (6) · post_apply_tools (12)
 └── api/
-    ├── schemas.py             Pydantic request/response models
-    ├── dependencies.py        FastAPI dependency injection
+    ├── schemas.py            InvokeRequest/Response · V2InvokeRequest · V2StreamRequest
+    ├── dependencies.py       get_graph() · get_v2_graph() · get_registry() · get_settings()
     └── routes/
-        ├── agent.py           /invoke and /stream endpoints
-        └── health.py          /health endpoint
+        ├── agent.py          v1 /invoke and /stream
+        ├── agent_v2.py       v2 /invoke and /stream
+        └── health.py         /health
 tests/
-└── test_agent_invoke.py       Integration test suite
+├── test_agent_invoke.py      pytest integration suite (v1 + health)
+└── test_v2_scenarios.py      14-scenario v2 end-to-end test runner
 docs/
-└── post-apply-assistant-lld.md  Low Level Design for the next production feature
+└── post-apply-assistant-lld.md  Low Level Design — v2 primary assistant + post_apply_assistant
 ```
 
 ---
@@ -281,4 +403,4 @@ docs/
 ## Related
 
 - **[candidate-mcp](../candidate-mcp)** — Java MCP server that this agent consumes.
-- **[docs/post-apply-assistant-lld.md](docs/post-apply-assistant-lld.md)** — LLD for the upcoming `post_apply_assistant` feature.
+- **[docs/post-apply-assistant-lld.md](docs/post-apply-assistant-lld.md)** — LLD for the v2 primary assistant and post_apply_assistant.

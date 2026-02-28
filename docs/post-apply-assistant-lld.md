@@ -3,8 +3,8 @@
 
 | Field | Detail |
 |---|---|
-| **Document Version** | 1.4 |
-| **Status** | Draft |
+| **Document Version** | 1.5 |
+| **Status** | Ready for Review |
 | **Component** | v2 Primary Assistant · post_apply_assistant (Python) · candidate-mcp (Java — production evolution) |
 | **Parent System** | Careers AI Platform |
 | **Depends On** | cx-applications · talent-profile-service · careers-data-schema |
@@ -377,9 +377,46 @@ The v2 graph uses its own `AgentState`. It does not share or modify the v1 state
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `messages` | `list[BaseMessage]` | `[]` | Conversation history (LangGraph managed) |
-| `candidate_id` | `str` | `""` | Candidate context for tool calls |
-| `application_id` | `str` | `""` | Set by v2 primary when routing a query about a specific application |
+| `candidate_id` | `str` | `""` | Candidate context for tool calls — **mandatory at the API boundary** |
+| `application_id` | `str` | `""` | Optional. When set, the assistant focuses on this specific application. When absent, the assistant retrieves all applications for the candidate via `getApplicationsByCandidate`. |
 | `correlation_id` | `str` | auto | Request trace ID |
+
+#### State Injection into LLM Context — Callable Prompt Pattern
+
+LangGraph state fields such as `candidate_id` and `application_id` are **not
+automatically visible to the LLM**. The LLM operates only on the `messages` list.
+Without explicit injection the LLM will prompt the user to provide IDs it already has.
+
+Both `v2_primary_assistant` and `post_apply_assistant` use **callable prompt
+functions** rather than static strings. At each inference step the callable reads
+the current state and appends an `## Active Request Context` block to the system
+prompt before passing it to the LLM.
+
+```mermaid
+flowchart LR
+    STATE["LangGraph State\n────────────────────\ncandidate_id: C002\napplication_id: A001\nmessages: [...]"]
+    CALLABLE["Callable Prompt\n_build_context_block()\n────────────────────\nReads candidate_id\nReads application_id\nBuilds context block"]
+    SYSMSG["System Message\n────────────────────\n...base prompt...\n\n## Active Request Context\ncandidateId: C002\napplicationId: A001\n<instruction>"]
+    LLM["LLM\n(has full context\nnever asks user\nfor IDs)"]
+
+    STATE --> CALLABLE
+    CALLABLE --> SYSMSG
+    SYSMSG --> LLM
+```
+
+The injected instruction differs based on whether `application_id` is present:
+
+| Scenario | `application_id` in state | Instruction injected |
+|---|---|---|
+| v2 primary (with app) | set | "Route immediately — candidateId and applicationId are already known." |
+| v2 primary (no app) | empty | "Route immediately — candidateId is known. No specific application — the specialist will retrieve all applications." |
+| post_apply (with app) | set | "A specific application is in scope. Use both IDs directly in tool calls." |
+| post_apply (no app) | empty | "No specific application was provided. Call `getApplicationsByCandidate(candidateId)` — do not ask the candidate for an application ID." |
+
+This pattern ensures:
+- The LLM never asks the candidate to supply IDs already present in the request.
+- When `application_id` is absent, `post_apply_assistant` automatically broadens its scope to the full application history rather than asking for clarification.
+- The base prompt strings are built once at startup; the context block is appended cheaply per inference step with no additional LLM calls.
 
 #### Handoff Trigger Conditions
 
@@ -1492,6 +1529,34 @@ flowchart TB
 - Handoff from primary to `post_apply_assistant` fires for recognised intent patterns.
 - `post_apply_assistant` reaches END with a non-empty response.
 - Schema resources are loaded and embedded in the system prompt during lifespan startup.
+
+**v2 Scenario Test Runner (`tests/test_v2_scenarios.py`)**
+
+A standalone script that exercises 14 end-to-end scenarios against a live stack and
+reports per-scenario pass/fail with tool call names, agent used, response preview,
+and total run time. Soft assertions check:
+- `agent_used` equals `"post_apply_assistant"` for all domain queries
+- Expected tools appear in `tool_calls`
+- Key domain keywords appear in the response text
+
+Scenarios covered (mapped to mock data in `candidate-mcp`):
+
+| # | Group | Candidate / Application | Scenario |
+|---|---|---|---|
+| 1 | Profile | C002 | Profile — no application_id → `getCandidateProfile` |
+| 2 | Profile | C001 / J002 | Skills gap vs unapplied role → `getSkillsGap` |
+| 3 | Application Status | C001 / A001 | FINAL_INTERVIEW status → `getApplicationStatus` |
+| 4 | Application Status | C004 / A004 | OFFER_EXTENDED — offer surfaced |
+| 5 | Application Status | C001 / A006 | REJECTED — constructive tone |
+| 6 | All Applications | C001 | Full history without application_id → `getApplicationsByCandidate` |
+| 7 | All Applications | C006 | Journey narrative without application_id |
+| 8 | Assessments | C004 / A004 | All 3 assessments (97–98th percentile) → `getAssessmentResults` |
+| 9 | Assessments | C002 / A002 | Percentile comparison (94th) → `compareToPercentile` |
+| 10 | Next Steps | C002 / A002 | PHONE_INTERVIEW prep → `getNextSteps` |
+| 11 | Next Steps | C006 / A007 | Stage duration / SLA check → `getStageDuration` |
+| 12 | Streaming | C003 / A003 | SSE stream — status + next steps (SCREENING stage) |
+| 13 | Edge Cases | C005 / A005 | HIRED candidate — journey summary → `getCandidateJourney` |
+| 14 | Edge Cases | C001 / A001 | Interview feedback (3 rounds + recruiter notes) → `getInterviewFeedback` |
 
 **End-to-End**
 - Candidate asks for application status → `agent_used: post_apply_assistant`, response references applicationId.
