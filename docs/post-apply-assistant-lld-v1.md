@@ -76,8 +76,8 @@ and v2 routes into one.
 - `candidate-agent` is a Python Uvicorn + LangGraph application. The v2 graph runs in the same process as v1; both share the MCP tool registry loaded at startup.
 - The primary assistant makes direct HTTP calls to `job-sync-service` for job data — this pattern is not used for the new sub-assistant; `candidate-mcp` is used instead.
 - `careers-data-schema` is a shared Maven library containing canonical Java domain models used across all backend services.
-- App2App authentication between `candidate-agent` and `candidate-mcp` uses an HMAC-SHA256 signature scheme. No external OAuth2 server is required for this hop.
-- `candidate-mcp` is already implemented as a stateless MCP server with in-memory data. The production work evolves it to call real downstream services with their own service-to-service OAuth2 tokens.
+- All service-to-service authentication uses App2App HMAC-SHA256 signature — both `candidate-agent` → `candidate-mcp` and `candidate-mcp` → downstream services.
+- `candidate-mcp` is already implemented as a stateless MCP server with in-memory data. The production work evolves it to call real downstream services using the same App2App signature scheme.
 
 ---
 
@@ -149,9 +149,9 @@ graph TB
     User -->|"v2 REST / SSE"| V2API
     PA -->|"existing direct HTTP\n(no changes)"| JSS
     PAA -->|"MCP + App2App Signature"| CMCP
-    CMCP -->|"REST + OAuth2"| CXA
-    CMCP -->|"REST + OAuth2"| TPS
-    CMCP -->|"REST + OAuth2\n(getJob enrichment)"| JSS2
+    CMCP -->|"REST + App2App Signature"| CXA
+    CMCP -->|"REST + App2App Signature"| TPS
+    CMCP -->|"REST + App2App Signature\n(getJob enrichment)"| JSS2
     CDS -.->|"domain models"| CMCP
     CDS -.->|"domain models"| CXA
     CDS -.->|"domain models"| TPS
@@ -497,7 +497,7 @@ candidate-mcp/
 │   ├── McpConfiguration          Tool & resource registration
 │   ├── WebClientConfiguration    One WebClient bean per downstream service
 │   ├── ResilienceConfiguration   Circuit breaker & retry registries
-│   └── SecurityConfiguration     App2App signature filter + OAuth2 client setup
+│   └── SecurityConfiguration     App2App signature filter (inbound) + SignatureProvider (outbound)
 ├── tool/
 │   ├── ProfileTools              Delegates to TalentProfileClient → transformer
 │   ├── ApplicationTools          Delegates to CxApplicationsClient → transformer
@@ -527,7 +527,7 @@ candidate-mcp/
 | HTTP client | WebClient (Project Reactor) + virtual threads for safe blocking in MCP handlers |
 | Domain models | `careers-data-schema` (Maven compile dependency) |
 | Auth (inbound from agent) | App2App HMAC-SHA256 signature validation |
-| Auth (outbound to downstream) | Spring Security OAuth2 Client (`client_credentials`) per service |
+| Auth (outbound to downstream) | App2App HMAC-SHA256 signature — one shared secret per downstream service |
 | Resilience | Resilience4j — circuit breaker + retry, one instance per downstream service |
 | Observability | Micrometer + OpenTelemetry (OTLP exporter) |
 | Caching | Spring Cache + Redis (tool-level cache for stable entity data) |
@@ -1003,14 +1003,15 @@ unseen pod is first established.
 
 ## 9. Security Design
 
-Two independent authentication boundaries exist: the Python agent → `candidate-mcp`
-hop uses **App2App signature auth**; the `candidate-mcp` → downstream services hop
-uses **OAuth2 client credentials**.
+All service-to-service authentication uses **App2App HMAC-SHA256 signature auth**.
+The same mechanism applies to both hops:
+`candidate-agent` → `candidate-mcp` and `candidate-mcp` → downstream services.
+Each hop uses independently registered app IDs and shared secrets.
 
 ### 9.1 App2App Signature Auth — candidate-agent to candidate-mcp
 
-No OAuth2 server or bearer tokens are involved on this hop. Trust is established via
-an HMAC-SHA256 request signature computed by the caller and validated by the receiver.
+Trust is established via an HMAC-SHA256 request signature computed by the caller
+and validated by the receiver.
 
 #### Signature Header Contract
 
@@ -1092,31 +1093,30 @@ flowchart LR
 
 ---
 
-### 9.2 OAuth2 — candidate-mcp to Downstream Services
+### 9.2 App2App Signature Auth — candidate-mcp to Downstream Services
 
-`candidate-mcp` acquires its own service tokens for calls to `cx-applications` and
-`talent-profile-service`. This is entirely internal to `candidate-mcp` and is
-transparent to the Python agent.
+`candidate-mcp` uses the same HMAC-SHA256 signature scheme when calling downstream
+services. Each downstream service registers `candidate-mcp` as a trusted `app_id`
+in its own Service Registry. A `SignatureProvider` in `candidate-mcp` computes and
+injects `X-App-Id`, `X-Timestamp`, and `X-Signature` on every outbound REST call.
 
 ```mermaid
-flowchart TD
+flowchart LR
     subgraph "candidate-mcp"
-        OC["OAuth2 Client\n(Spring Security · client_credentials)"]
+        SP["SignatureProvider\ncomputes HMAC-SHA256\ninjects X-* headers"]
         PT["ProfileTools"]
         AT["ApplicationTools"]
-        OC -->|"Bearer token injected\nby WebClient filter"| PT
-        OC -->|"Bearer token injected\nby WebClient filter"| AT
+        JT["JobTools"]
+        PT & AT & JT --> SP
     end
 
-    AUTH[("OAuth2 Auth Server")]
-    TPS["talent-profile-service"]
-    CXA["cx-applications"]
+    TPS["talent-profile-service\n(validates X-App-Id/Signature)"]
+    CXA["cx-applications\n(validates X-App-Id/Signature)"]
+    JSS["job-sync-service\n(validates X-App-Id/Signature)"]
 
-    OC -->|"client_credentials grant\n(scope: profiles:read)"| AUTH
-    OC -->|"client_credentials grant\n(scope: applications:read)"| AUTH
-    AUTH -->|"access_token"| OC
-    PT -->|"Bearer token"| TPS
-    AT -->|"Bearer token"| CXA
+    SP -->|"REST + App2App Signature"| TPS
+    SP -->|"REST + App2App Signature"| CXA
+    SP -->|"REST + App2App Signature"| JSS
 ```
 
 ---
@@ -1128,7 +1128,7 @@ flowchart TD
 | **App2App — no shared user context** | The agent-to-MCP hop is machine-to-machine. No user bearer token is forwarded through the agent. |
 | **Replay attack prevention** | Signature TTL (default 5 min) prevents reuse of a captured signature. Clock skew tolerance is not added — clocks must be synchronised (NTP). |
 | **Per-client TTL control** | High-sensitivity deployments can reduce TTL below 5 min at the service registry level without redeploying the agent. |
-| **Least privilege (downstream)** | Each downstream service has its own OAuth2 client registration with a narrow scope. `talent-profile-service` and `cx-applications` tokens are never shared. |
+| **Least privilege (downstream)** | Each downstream service registers `candidate-mcp` with its own app_id and independent shared secret. Secrets are never shared across services. |
 | **No secrets in code** | App secret (`APP_SECRET`) injected via Kubernetes `Secret` → env variable. MCP service registry secrets stored in Vault or K8s Secrets, never in `application.yml`. |
 | **MCP endpoint hardened** | `/mcp/**` requires a valid App2App signature. `/actuator/health/**` is public for probe access only. |
 
@@ -1517,7 +1517,7 @@ flowchart TB
 **Integration (Java — Spring Boot + WireMock)**
 - Full tool call through WebClient to a WireMocked downstream service.
 - Circuit breaker trips after 20 consecutive failures.
-- OAuth2 token is acquired and injected into the downstream request header.
+- App2App signature headers are computed and injected into the downstream request header.
 - Schema resources are served at startup and contain the expected JSON Schema fields.
 
 **Contract (Pact)**
@@ -1583,7 +1583,6 @@ flowchart TD
 
         subgraph "Infrastructure"
             REDIS[("Redis")]
-            AUTH[("OAuth2 Auth Server")]
         end
 
         INGRESS["Ingress / API Gateway"]
@@ -1599,8 +1598,7 @@ flowchart TD
     CMCP --> REDIS
     CMCP --> CXA
     CMCP --> TPS
-    AGT --> AUTH
-    CMCP --> AUTH
+
 ```
 
 ### 15.2 Health Checks
@@ -1619,7 +1617,7 @@ recovers.
 | Config Type | Mechanism |
 |---|---|
 | Service URLs | Kubernetes `ConfigMap` → environment variables |
-| OAuth2 client secrets | Kubernetes `Secret` → environment variables |
+| App2App shared secrets | Kubernetes `Secret` → environment variables (one per service pair) |
 | Redis connection | Kubernetes `Secret` → Spring config |
 | candidate-mcp URL (Python) | Kubernetes `ConfigMap` → `.env` |
 
@@ -1672,23 +1670,21 @@ consolidation replaces v1 with v2 once all sub-assistants are stable.
 
 ---
 
-### DD-03: App2App HMAC-SHA256 Signature Between Agent and candidate-mcp
+### DD-03: App2App HMAC-SHA256 Signature for All Service-to-Service Calls
 
-**Decision:** The Python agent authenticates to `candidate-mcp` using a per-request
-HMAC-SHA256 signature rather than OAuth2 bearer tokens.
+**Decision:** All internal service-to-service authentication uses HMAC-SHA256
+signature — both `candidate-agent` → `candidate-mcp` and `candidate-mcp` →
+downstream services. No OAuth2 server is involved at any hop.
 
 **Alternatives considered:**
-- Mutual TLS (mTLS) → provides strong identity but adds certificate lifecycle
-  complexity for an internal service hop.
-- OAuth2 client credentials (JWT bearer) → requires an OAuth2 server for an
-  internal machine-to-machine channel; adds a network dependency on the hot path.
-- No authentication → rejected immediately; the MCP endpoint exposes live candidate
-  data.
+- Mutual TLS (mTLS) → certificate lifecycle complexity for internal service hops.
+- OAuth2 client credentials (JWT bearer) → requires an OAuth2 server; adds a
+  network dependency on the hot path for every service call.
+- No authentication → rejected immediately; all endpoints expose live candidate data.
 
-**Consequence:** Authentication is self-contained within the two services. The shared
-secret must be rotated as part of key lifecycle procedures. Secret rotation requires
-redeployment of both services (or live reload from Vault) but involves no external
-system coordination.
+**Consequence:** Authentication is entirely self-contained. No external auth server
+dependency at any hop. All secrets managed via K8s Secrets / Vault. Rotation
+requires coordinated redeployment of the affected service pair (or live Vault reload).
 
 ---
 
@@ -1840,7 +1836,7 @@ assistant can still answer application status queries without job details.
 | ID | Issue / Risk | Severity | Owner | Status |
 |---|---|---|---|---|
 | R-01 | `langchain-mcp-adapters` does not natively support custom per-request header injection. The `SignatureProvider` must wrap or patch the httpx transport layer. Verify compatibility with `langchain-mcp-adapters 0.2.x`. Same httpx transport patch also enables shared connection pool for TLS reuse. | High | Platform team | Open — spike required |
-| R-02 | App2App shared secret rotation requires redeployment of both `candidate-agent` and `candidate-mcp` (or live Vault reload). Secret rotation procedure must be defined before production. | High | Security / Infra | Open |
+| R-02 | App2App shared secret rotation requires coordinated redeployment of the affected service pair (or live Vault reload). Applies to all three service hops. Rotation procedure not yet defined. | High | Security / Infra | Open |
 | R-03 | Clock drift between the Python agent host and `candidate-mcp` pods may cause valid signatures to be rejected if drift exceeds TTL. NTP synchronisation must be enforced across all pods. | Medium | Infra team | Open |
 | R-04 | `careers-data-schema` does not currently produce JSON Schema output. Serialisation logic must be added to `candidate-mcp`. | Medium | Backend team | Open |
 | R-05 | Downstream service API contracts with `cx-applications` and `talent-profile-service` are not yet formalised as Pact consumer contracts. Schema drift is undetected until runtime. | Medium | QA / Backend teams | Open — Pact adoption planned for Q3 |

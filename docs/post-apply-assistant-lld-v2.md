@@ -17,7 +17,7 @@ Introduce a **v2 API route** (`/api/v2/agent/`) and a `post_apply_assistant` sub
 - New `/api/v2/agent/invoke` and `/api/v2/agent/stream` routes
 - `v2_primary_assistant` (router) + `post_apply_assistant` (specialist) LangGraph nodes
 - `candidate-mcp` evolution: real downstream service clients + PII-stripping transformer
-- App2App HMAC-SHA256 auth between `candidate-agent` and `candidate-mcp`
+- App2App HMAC-SHA256 auth for all service-to-service hops (agent → MCP, MCP → downstream)
 - TLS connection pool, Redis caching, conversation checkpointer
 
 **Out of scope:** v1 routes/graph (untouched), frontend integration, infra provisioning.
@@ -65,9 +65,9 @@ flowchart LR
         Clients["TalentProfileClient\nCxApplicationsClient · JobSyncClient"]
         Tools --> XFMR --> Clients
     end
-    Clients -->|"REST + OAuth2"| TPS["talent-profile-service"]
-    Clients -->|"REST + OAuth2"| CXA["cx-applications"]
-    Clients -->|"REST + OAuth2"| JSS["job-sync-service"]
+    Clients -->|"REST + App2App Signature"| TPS["talent-profile-service"]
+    Clients -->|"REST + App2App Signature"| CXA["cx-applications"]
+    Clients -->|"REST + App2App Signature"| JSS["job-sync-service"]
 ```
 
 ---
@@ -126,23 +126,25 @@ The LLM only sees `messages`, not state fields. Both agents use callable prompt 
 
 ## 4. Security
 
-### App2App Signature Auth (agent → candidate-mcp)
+All service-to-service calls use **App2App HMAC-SHA256 signature auth**. There is no OAuth2 server in the platform. The same header contract applies to both hops.
 
-Each MCP request carries three headers:
+### Signature Header Contract
 
 | Header | Value |
 |---|---|
-| `X-App-Id` | Registered caller ID (`candidate-agent-prod`) |
+| `X-App-Id` | Registered caller ID (e.g. `candidate-agent-prod`, `candidate-mcp-prod`) |
 | `X-Timestamp` | UTC Unix epoch seconds |
 | `X-Signature` | `HMAC-SHA256(secret, app_id + ":" + timestamp + ":" + path)` hex |
 
-`candidate-mcp` looks up `app_id` in its Service Registry (secret + `ttl_seconds`, default 300s), verifies the HMAC and timestamp window. Returns `401 SIGNATURE_EXPIRED` or `401 SIGNATURE_INVALID` on failure.
+The receiver looks up `app_id` in its Service Registry (secret + `ttl_seconds`, default 300s), verifies the HMAC and timestamp window. Returns `401 SIGNATURE_EXPIRED` or `401 SIGNATURE_INVALID` on failure.
 
-`candidate-agent` implements a `SignatureProvider` transport wrapper injecting these headers. `APP_ID` and `APP_SECRET` come from environment variables (K8s Secret).
+### candidate-agent → candidate-mcp
 
-### candidate-mcp → Downstream
+`candidate-agent` implements a `SignatureProvider` transport wrapper that injects the three signature headers into every outgoing MCP request. `APP_ID` and `APP_SECRET` are injected via K8s Secret → environment variable.
 
-Spring Security OAuth2 `client_credentials` grant per downstream service. Bearer token injected by WebClient filter. Transparent to the Python agent.
+### candidate-mcp → Downstream Services
+
+`candidate-mcp` acts as the caller for all three downstream services. Each downstream service registers `candidate-mcp` as a trusted `app_id` in its own Service Registry. A `SignatureProvider` in `candidate-mcp` injects the headers on every outbound REST call — identical mechanism, independent secret per service.
 
 ---
 
@@ -234,7 +236,7 @@ Stack traces, internal URLs, and raw downstream bodies never appear in tool resp
 | Layer | Tool | Key Scenarios |
 |---|---|---|
 | Unit (Java) | JUnit 5 | Tool handlers return correct JSON shape; 404 returns typed envelope; circuit open returns degraded response |
-| Integration (Java) | Spring Boot Test + WireMock | Full tool call with real WebClient to stubbed downstream; OAuth2 token injected; circuit breaker trips |
+| Integration (Java) | Spring Boot Test + WireMock | Full tool call with real WebClient to stubbed downstream; App2App signature injected; circuit breaker trips |
 | Contract | Pact | `candidate-mcp` publishes consumer contracts for `cx-applications` and `talent-profile-service` |
 | Integration (Python) | pytest + ASGI client | Handoff fires; `post_apply_assistant` reaches END with non-empty response; schemas embedded at startup |
 | Scenario (Python) | `test_v2_scenarios.py` | 14 end-to-end scenarios covering profile, application status, assessments, next steps, SSE streaming, edge cases (HIRED, REJECTED, OFFER) |
@@ -248,8 +250,7 @@ flowchart LR
     INGRESS --> AGT["candidate-agent\nPython · 2 pods · 8 workers each"]
     AGT -->|"MCP + App2App"| CMCP["candidate-mcp\nJava · 2 pods"]
     AGT & CMCP --> REDIS[("Redis")]
-    CMCP -->|"OAuth2"| AUTH[("Auth Server")]
-    CMCP --> CXA["cx-applications"] & TPS["talent-profile-service"]
+    CMCP -->|"REST + App2App"| CXA["cx-applications"] & TPS["talent-profile-service"] & JSS["job-sync-service"]
 ```
 
 | Service | Liveness | Readiness |
@@ -265,7 +266,7 @@ flowchart LR
 |---|---|---|
 | **DD-01** Three-layer transformation | PII strip in `candidate-mcp` (Layer 1), LLM context filter in system prompt (Layer 2), candidate-facing formatting in system prompt (Layer 3). | Each layer has one owner. PII policy changes touch only `candidate-mcp`. Tone changes touch only the Python prompt. No cross-layer coupling. |
 | **DD-02** v2 route isolation | New `/api/v2/` route + separate compiled graph in same process. v1 untouched. | v1 production stability preserved. v2 iterated independently. Future consolidation: v2 absorbs v1 once all sub-assistants are stable. Rejected: injecting into v1 graph risked destabilising live job search assistant. |
-| **DD-03** App2App HMAC-SHA256 | Per-request signature over shared secret. No OAuth2 server on agent-to-MCP hop. | Self-contained. No external auth server dependency on the hot path. Secret rotation requires redeployment (or live Vault reload). Rejected: mTLS (cert lifecycle complexity), OAuth2 (adds network hop). |
+| **DD-03** App2App HMAC-SHA256 for all hops | Per-request HMAC-SHA256 signature used for ALL internal service-to-service calls: `candidate-agent` → `candidate-mcp` and `candidate-mcp` → downstream services. | Independent secret per service pair. Rotation requires coordinated redeployment or live Vault reload across the affected pair. Rejected: mTLS (cert lifecycle complexity), OAuth2 (network hop on hot path). |
 | **DD-04** Reuse candidate-mcp | `post_apply_assistant` connects to existing `candidate-mcp`, evolved to call real services. No new MCP server. | All candidate domain tooling in one place. Schema resources centralised. |
 | **DD-05** MCP static resources as schema carrier | `candidate-mcp` takes `careers-data-schema` as compile dep, serialises to JSON Schema, exposes as MCP static resources. Python agent embeds at startup. | No parallel Python models to maintain. LLM grounded in exact field names. Schema drift detected at `candidate-mcp` build time. |
 | **DD-06** Stateless MCP | `STATELESS` protocol mode — each tool call is an independent HTTP request. | Trivial horizontal scaling. Session-init overhead per call is dominated by downstream latency. |
@@ -281,7 +282,7 @@ flowchart LR
 | ID | Risk | Severity | Status |
 |---|---|---|---|
 | R-01 | `langchain-mcp-adapters` has no native custom header injection. `SignatureProvider` must wrap/patch httpx transport. Same patch enables shared connection pool. Verify with `0.2.x`. | High | Open — spike required |
-| R-02 | App2App secret rotation requires redeployment of both services (or Vault live reload). Rotation procedure not yet defined. | High | Open |
+| R-02 | App2App secret rotation requires coordinated redeployment of the affected service pair (or live Vault reload). Applies to all three hops. Rotation procedure not yet defined. | High | Open |
 | R-03 | Clock drift between agent host and `candidate-mcp` pods may cause valid signatures to be rejected if drift > TTL. NTP sync required. | Medium | Open |
 | R-04 | `careers-data-schema` does not currently produce JSON Schema. Serialisation logic must be added to `candidate-mcp`. | Medium | Open |
 | R-05 | Downstream API contracts with `cx-applications` and `talent-profile-service` not yet formalised as Pact contracts. Schema drift undetected until runtime. | Medium | Open — Pact planned Q3 |
