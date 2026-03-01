@@ -1213,11 +1213,11 @@ public ApplicationStatus getApplicationStatus(
 ```
 
 ---
-## 5.7 Schema Bridge
+### 5.7 Schema Bridge
 
 This section describes how canonical Java domain models defined in `careers-data-schema` are made available to the Python LLM agent without any Python-side model definitions or code generation.
 
-### 5.7.1 The Problem
+#### 5.7.1 The Problem
 
 The Careers platform is a Java-first ecosystem. All domain models are defined once in the shared
 `careers-data-schema` Maven library and used by every backend service, including
@@ -1232,7 +1232,7 @@ problems arise:
 - Teams are forced to maintain parallel model definitions in Python alongside the
   authoritative Java ones.
 
-### 5.7.2 The Solution — MCP Static Resources as Schema Carrier
+#### 5.7.2 The Solution — MCP Static Resources as Schema Carrier
 
 `candidate-mcp` takes `careers-data-schema` as a compile-time Maven dependency. At
 startup, it serialises the **projected** `AgentContext` DTO shapes — not the raw
@@ -1266,7 +1266,7 @@ flowchart LR
     CMCP -->|"ats://schema/* ats://workflow/application-stages"| REG
 ```
 
-### 5.7.3 Benefits
+#### 5.7.3 Benefits
 
 | Benefit | Detail |
 |---|---|
@@ -1277,7 +1277,7 @@ flowchart LR
 | **Cross-team alignment** | Java engineers own the schema in a familiar Maven package. Python engineers consume it with no Java knowledge required. |
 | **Deployment audit trail** | The schemas embedded in the prompt are version-locked to the `candidate-mcp` release. Every deployment produces a traceable snapshot of the schema the agent was operating with. |
 
-### 5.7.4 Schema Resources Exposed by candidate-mcp
+#### 5.7.4 Schema Resources Exposed by candidate-mcp
 
 Each schema resource describes the **projected agent-context shape** — the fields that
 survive PII stripping and the Layer 1 transformer. Raw Cosmos document fields that are
