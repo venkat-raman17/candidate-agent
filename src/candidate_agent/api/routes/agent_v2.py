@@ -12,14 +12,25 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
-
+from langfuse.langchain import CallbackHandler
+ 
 from candidate_agent.api.dependencies import get_v2_graph
 from candidate_agent.api.schemas import InvokeResponse, V2InvokeRequest, V2StreamRequest
+import os
+
+
+LANGFUSE_SECRET_KEY="sk-lf-1205fdff-cde4-409a-9b14-b9798dfa1ec0"
+LANGFUSE_PUBLIC_KEY="pk-lf-77cf9a70-8fe4-4d9e-9cde-3d8aab018b72"
+LANGFUSE_BASE_URL="http://localhost:3000"
+
+os.environ["LANGFUSE_SECRET_KEY"] = LANGFUSE_SECRET_KEY
+os.environ["LANGFUSE_PUBLIC_KEY"] = LANGFUSE_PUBLIC_KEY
+os.environ["LANGFUSE_BASE_URL"] = LANGFUSE_BASE_URL
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["agent-v2"])
-
+langfuse_handler = CallbackHandler()
 
 def _build_v2_input(
     message: str,
@@ -84,7 +95,7 @@ async def v2_invoke(req: V2InvokeRequest, graph=Depends(get_v2_graph)) -> Invoke
     )
     log.info("v2_invoke_start")
 
-    config = {"configurable": {"thread_id": req.thread_id}}
+    config = {"configurable": {"thread_id": req.thread_id}, "callbacks": [langfuse_handler]}
 
     try:
         final_state = await graph.ainvoke(
@@ -121,7 +132,7 @@ async def v2_stream(req: V2StreamRequest, graph=Depends(get_v2_graph)) -> Stream
     )
     log.info("v2_stream_start")
 
-    config = {"configurable": {"thread_id": req.thread_id}}
+    config = {"configurable": {"thread_id": req.thread_id}, "callbacks": [langfuse_handler]}
     input_state = _build_v2_input(
         req.message, req.candidate_id, req.application_id, req.correlation_id
     )

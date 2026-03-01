@@ -36,6 +36,7 @@ POST_APPLY_TOOL_NAMES: frozenset[str] = frozenset(
         # Profile
         "getCandidateProfile",
         "getSkillsGap",
+        "getCandidatePreferences",  # NEW: location, job, work style preferences
         # Application
         "getApplicationStatus",
         "getApplicationsByCandidate",
@@ -43,6 +44,9 @@ POST_APPLY_TOOL_NAMES: frozenset[str] = frozenset(
         "getNextSteps",
         "getStageDuration",
         "getInterviewFeedback",
+        "getApplicationGroup",  # NEW: draft multi-job applications
+        "getApplicationGroupsByCandidate",  # NEW: all draft applications
+        "getScheduledEvents",  # NEW: upcoming interview schedule
         # Job enrichment — application.jobId → full job details (title, location, assessment codes)
         "getJob",
         # Assessment
