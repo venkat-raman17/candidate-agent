@@ -2036,4 +2036,19 @@ assistant can still answer application status queries without job details.
 
 ---
 
+## 17. Jira Stories
+
+Considering four-week development sprints with two developers (Dev A and Dev B), the following Jira stories are proposed to implement the Post-Apply Assistant MVP with the outlined design:
+
+| Key | Epic | Story | Lead | Support | Repo(s) | Depends On | SP | Est. Dev-Days |
+|---|---|---|---|---|---|---|---:|---:|
+| PAA-4W-01 | EPA | Add `/api/v2/agent/invoke` and `/api/v2/agent/stream` routes with dedicated v2 graph wiring | Dev A | Dev B | careers-ai-service | - | 3 | 2 |
+| PAA-4W-02 | EPA | Implement `primary_assistant_2` handoff + callable prompt context injection (`talent_profile_id`, `ats_requisition_id`) | Dev A | Dev B | careers-ai-service | PAA-4W-01 | 8 | 6 |
+| PAA-4W-03 | EPA | Implement MCP startup integration (registry init, tool load, post-apply tool filter) | Dev A | Dev B | careers-ai-service | PAA-4W-01 | 3 | 2 |
+| PAA-4W-04 | EPB | Implement `candidate-mcp` MVP tool slice: baseline wiring + `getActionableApplications`, `getApplicationDetails`, `getJobDetails` with Layer-1 projection | Dev B | Dev A | candidate-mcp | - | 8 | 6 |
+| PAA-4W-05 | EPC | Implement App2App auth MVP on both hops (Python→MCP and MCP→downstream): signing + validation + TTL config | Dev B | Dev A | Both | PAA-4W-03,PAA-4W-04 | 8 | 6 |
+| PAA-4W-06 | EPF | Implement guardrails + error mapping MVP: recursion cap, request timeout, tool-call cap, typed error envelope alignment | Dev A | Dev B | Both | PAA-4W-02,PAA-4W-04 | 5 | 4 |
+| PAA-4W-07 | EPG | Java MVP tests: tool handler tests + integration tests for auth and core tool flows | Dev B | Dev A | candidate-mcp | PAA-4W-04,PAA-4W-05 | 4 | 3 |
+| PAA-4W-08 | EPG | Python MVP tests: v2 invoke/stream integration + happy path + degraded response E2E scenarios | Dev A | Dev B | careers-ai-service | PAA-4W-02,PAA-4W-03,PAA-4W-06 | 5 | 4 |
+
 **Document Author**: Venkat Raman K S
