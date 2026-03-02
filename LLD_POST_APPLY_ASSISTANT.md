@@ -27,17 +27,20 @@
         5.5.1 [Recursion & Iteration Limits](#551-recursion--iteration-limits)
         5.5.2 [ID Validation Strategy](#552-id-validation-strategy)
         5.5.3 [Convergence Patterns](#553-convergence-patterns)
+        5.5.4 [System Prompt Enhancements](#554-system-prompt-enhancements)
+        5.5.5 [Tool Schema Improvements](#555-tool-schema-improvements)
+    5.6 [Schema Bridge](#56-schema-bridge)
+        5.6.1 [The Problem](#561-the-problem)
+        5.6.2 [The Solution — candidate-mcp Exposes Schemas as MCP Resources](#562-the-solution--candidate-mcp-exposes-schemas-as-mcp-resources)
+        5.6.3 [Schema Resources Exposed by candidate-mcp](#563-schema-resources-exposed-by-candidate-mcp)
 6. [Key Data Flows](#6-key-data-flows)
 7. [Integration Design](#7-integration-design)
 8. [Security Design](#8-security-design)
 9. [Resilience Design](#9-resilience-design)
 10. [Observability Design](#10-observability-design)
 11. [Caching Design](#11-caching-design)
-    11.1 [MCP Static Resource Schema Cache — careers-ai-service side](#111-mcp-static-resource-schema-cache--careers-ai-service-side)
-    11.2 [LangGraph Thread State — Conversation Checkpointer](#112-langgraph-thread-state--conversation-checkpointer)
-    11.3 [Within-Session Tool Response Cache — careers-ai-service side](#113-within-session-tool-response-cache--careers-ai-service-side)
-    11.4 [Tool Response Cache — candidate-mcp side](#114-tool-response-cache--candidate-mcp-side)
-    11.5 [Cache Hierarchy Summary](#115-cache-hierarchy-summary)
+    11.1 [LangGraph Thread State — Conversation Checkpointer](#111-langgraph-thread-state--conversation-checkpointer)
+    11.2 [Cache Hierarchy Summary](#112-cache-hierarchy-summary)
 12. [Error Handling](#12-error-handling)
 13. [Testing Strategy](#13-testing-strategy)
 14. [Deployment](#14-deployment)
@@ -71,7 +74,7 @@ and v2 routes into one.
 - **App2App signature authentication** between `careers-ai-service` and `candidate-mcp`: signature generated per request, 5-minute default TTL, configurable per client in the `candidate-mcp` service registry
 - **TLS connection pool configuration** for the httpx transport: shared persistent pool with HTTP/2 and TLS session resumption to eliminate per-tool-call handshake overhead
 - Implementation of downstream REST client integration in `candidate-mcp`
-- Schema sharing strategy: how `careers-data-schema` models flow through `candidate-mcp` into the LLM prompt
+- Schema sharing strategy: `candidate-mcp` exposes `careers-data-schema` models as MCP static resources — available as a contract reference.
 - Resilience, observability, and caching
 - Testing strategy covering unit, integration, and contract tests
 - **Agent guardrails**: recursion limits (10 iterations), request timeouts (30 seconds), tool call limits (10 per request)
@@ -105,7 +108,7 @@ and v2 routes into one.
 | **Handoff Tool** | A LangGraph `@tool` that, when called by the primary assistant, routes execution to a named sub-assistant |
 | **candidate-mcp** | The Java MCP server that exposes candidate domain tools and schema resources. Calls downstream services from its tools. |
 | **careers-data-schema** | Shared Java Maven library containing canonical domain models used across all Careers platform services |
-| **MCP Resource** | A static or templated data object served by the MCP server — fetched once at agent startup and embedded into LLM system prompts |
+| **MCP Resource** | A static or templated data object served by the MCP server — exposed by `candidate-mcp` as a schema contract for domain models; not currently loaded by the Python agent |
 | **MCP Tool** | A callable function the LLM agent invokes at runtime to retrieve live data |
 | **Circuit Breaker** | Resilience pattern that stops calls to a failing downstream service and returns a structured fallback |
 | **Virtual Threads** | Java 21 lightweight threads that make blocking I/O safe within synchronous MCP tool handlers |
@@ -221,7 +224,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph "Python Agent Process"
-        REG["MCPToolRegistry post_apply_tools[] schemas embedded in LLM prompts"]
+        REG["MCPToolRegistry post_apply_tools[]"]
         PAA["post_apply_assistant"]
         REG --> PAA
     end
@@ -834,69 +837,51 @@ public ApplicationDetails getApplicationDetails(
 ```
 
 ---
-### 5.7 Schema Bridge
+### 5.6 Schema Bridge
 
-This section describes how canonical Java domain models defined in `careers-data-schema` are made available to the Python LLM agent without any Python-side model definitions or code generation.
+This section describes how canonical Java domain models defined in `careers-data-schema` are available as a shared contract without requiring Python-side model definitions or code generation.
 
-#### 5.7.1 The Problem
+#### 5.6.1 The Problem
 
 The Careers platform is a Java-first ecosystem. All domain models are defined once in the shared
 `careers-data-schema` Maven library and used by every backend service, including
 `cx-applications` and `talent-profile-service`.
 
-The Python LangGraph agent sits outside this ecosystem. Without a bridge, three
-problems arise:
+The Python LangGraph agent sits outside this ecosystem. Without a bridge:
 
-- The LLM does not know the shape of data returned from tool calls, leading to
-  hallucinated field names and incorrect reasoning.
-- Schema changes in `careers-data-schema` silently break agent behaviour.
-- Teams are forced to maintain parallel model definitions in Python alongside the
-  authoritative Java ones.
+- Teams would be forced to maintain parallel model definitions in Python alongside the authoritative Java ones.
+- Schema changes in `careers-data-schema` could silently diverge from whatever the Python side assumes.
 
-#### 5.7.2 The Solution — MCP Static Resources as Schema Carrier
+#### 5.6.2 The Solution — candidate-mcp Exposes Schemas as MCP Resources
 
-`candidate-mcp` takes `careers-data-schema` as a compile-time Maven dependency. At
-startup, it serialises the **projected** `AgentContext` DTO shapes — not the raw
-Cosmos document shapes — to JSON Schema and exposes them as MCP static resources.
-The Python agent fetches these once at startup and embeds them into the LLM system
-prompt before any conversation begins.
+`candidate-mcp` takes `careers-data-schema` as a compile-time Maven dependency. At startup, it
+serialises the **projected** `AgentContext` DTO shapes — not raw Cosmos document shapes —
+to JSON Schema and exposes them as MCP static resources.
+
+The Python agent does **not** load these resources at startup. They serve as the authoritative
+contract between `candidate-mcp` and any consumer (Python agent, integration tests, developer
+tooling). The tool response shape returned at runtime is always consistent with the published schema.
 
 ```mermaid
 flowchart LR
     subgraph "Java Ecosystem"
         CDS["careers-data-schema (Maven compile)"]
-
-        CMCP["candidate-mcp (Serialises models JSON Schema and expose)"]
-
+        CMCP["candidate-mcp (serialises models → JSON Schema, exposes as MCP resources)"]
         CDS -->|"dependency"| CMCP
     end
 
-    subgraph "Python Agent — Startup"
-        REG["MCPToolRegistry init_registry()"]
-        LLM["LLM System Prompt (schema aware)"]
-
-        REG -->|"build prompts"| LLM
+    subgraph "Python Agent"
+        REG["MCPToolRegistry — tools"]
     end
 
-    CMCP -->|"cx://schema/* cx://workflow/application-stages"| REG
+    CMCP -->|"tool responses conform to schema"| REG
+    CMCP -.->|"cx://schema/* available on request"| REG
 ```
 
-#### 5.7.3 Benefits
-
-| Benefit | Detail |
-|---|---|
-| **Single source of truth** | Schema is authored once in `careers-data-schema`. No Python model to maintain alongside it. |
-| **Zero schema drift** | A field rename or new enum value in Java propagates to the agent automatically when `candidate-mcp` is rebuilt and redeployed. |
-| **No code generation pipeline** | No OpenAPI → Python dataclass step. The MCP resource is the contract. |
-| **LLM grounding** | The LLM receives precise field names, types, required fields, and enum values in its system prompt. This directly improves tool call accuracy and eliminates hallucinated field names. |
-| **Cross-team alignment** | Java engineers own the schema in a familiar Maven package. Python engineers consume it with no Java knowledge required. |
-| **Deployment audit trail** | The schemas embedded in the prompt are version-locked to the `candidate-mcp` release. Every deployment produces a traceable snapshot of the schema the agent was operating with. |
-
-#### 5.7.4 Schema Resources Exposed by candidate-mcp
+#### 5.6.3 Schema Resources Exposed by candidate-mcp
 
 Each schema resource describes the **projected agent-context shape** — the fields that
-survive PII stripping and the Layer 1 transformer. Raw Cosmos document fields that are
-stripped (PII, internal metadata, database artefacts) are not present.
+survive PII stripping and the Layer 1 transformer.
 
 | MCP Resource URI | Projected Source | Content (agent-safe fields only) |
 |---|---|---|
@@ -905,14 +890,15 @@ stripped (PII, internal metadata, database artefacts) are not present.
 | `cx://schema/job` | `JobRequisition` | Title, status, location, job type, shift details — no internal fields |
 | `cx://schema/application-stages` | `ApplicationStage` | Enum of all possible application stages with descriptions — no internal fields |
 
+> **Note:** The Python agent does not call `get_resources()` at startup. These URIs are available if a future use case — such as integration-test contract assertions or an on-demand drift-detection check — requires fetching them.
+
 ---
 
 ## 6. Key Data Flows
 
-### 6.1 Agent Startup — Tool and Schema Loading
+### 6.1 Agent Startup — Tool Loading
 
-The Python application loads tools and embeds schemas once during startup, before
-serving any request.
+The Python application loads MCP tools once during startup before serving any request.
 
 ```mermaid
 sequenceDiagram
@@ -922,13 +908,9 @@ sequenceDiagram
 
     App->>Reg: init_registry(settings)
     Reg->>CMCP: get_tools()
-    CMCP-->>Reg: post_apply tool list
-    Reg->>CMCP: get_resources(schema URIs)
-    note over CMCP: Resources serialised from careers-data-schema
-    CMCP-->>Reg: JSON Schema blobs
+    CMCP-->>Reg: tool list (post_apply_tools)
     Reg->>App: registry ready
-    App->>App: build_post_apply_prompt(schemas)
-    note over App: Schemas embedded in LLM<br/>system prompt — LLM now knows<br/>exact field names and enums
+    App->>App: build_post_apply_prompt()
     App->>App: compile StateGraph (add post_apply node)
     App->>App: serve requests
 ```
@@ -1092,12 +1074,10 @@ async def lifespan(app: FastAPI):
     yield
 ```
 
-#### 7.1.2 Load candidate-mcp tools and static schema resources
+#### 7.1.2 Load candidate-mcp tools at startup
 
-At startup, create the MCP client (`streamable_http`), then fetch:
-
-- dynamic callable tools (for runtime tool invocation)
-- static resources (for system-prompt schema grounding)
+At startup, create the MCP client (`streamable_http`), then fetch dynamic callable tools
+for runtime tool invocation.
 
 ```python
 client = MultiServerMCPClient(
@@ -1112,14 +1092,7 @@ client = MultiServerMCPClient(
 
 all_tools = await client.get_tools()
 post_apply_tools = [t for t in all_tools if t.name in POST_APPLY_TOOL_NAMES]
-blobs = await client.get_resources("candidate_mcp", uris=_KNOWLEDGE_URIS)
 ```
-
-Resource URIs loaded in the reference implementation:
-
-- `cx://workflow/application-states`
-- `cx://schema/candidate`
-- `cx://schema/application`
 
 ### 7.2 MCP Protocol and TLS Handshake Optimisation
 
@@ -1640,60 +1613,12 @@ flowchart LR
     end
 
     W1 & W2 & WN <-->|"read / write"| NS2
-    SR -.->|"fetched once then cached in worker memory"| W1
-    SR -.->|"fetched once then cached in worker memory"| W2
-    SR -.->|"fetched once then cached in worker memory"| WN
 ```
 
 ---
 
-### 11.1 MCP Static Resource Schema Cache — careers-ai-service side
 
-**Problem:** `candidate-mcp` exposes 4–5 static JSON Schema resources
-(`cx://schema/*`). The Python agent fetches these during `init_registry()` at
-startup and embeds them in the LLM system prompt. With **8 Uvicorn worker
-processes per pod** and multiple pods, each worker starts independently and calls
-`init_registry()`.
-
-**Solution — per-worker in-memory schema cache:**
-
-Each worker fetches MCP static resources once during startup and stores them in
-process memory for the lifetime of that worker. Subsequent requests served by the
-same worker reuse the in-memory schemas to build prompt context.
-
-```mermaid
-sequenceDiagram
-    participant W1 as Worker 1
-    participant W2 as Worker 2
-    participant CMCP as candidate-mcp
-
-    par Worker 1 startup
-        W1->>CMCP: fetch all static resources
-        CMCP-->>W1: schema blobs
-        W1->>W1: cache schemas in memory
-    and Worker 2 startup (concurrent)
-        W2->>CMCP: fetch all static resources
-        CMCP-->>W2: schema blobs
-        W2->>W2: cache schemas in memory
-    end
-
-    note over W1,W2: each worker fetches once at startup,<br/>then reuses schemas for all requests
-```
-
-**Key design rules:**
-
-| Rule | Detail |
-|---|---|
-| Cache scope | Process-local memory (per worker) |
-| Cache lifetime | Worker lifetime (refreshes on worker restart/redeploy) |
-| Invalidation | Implicit via worker restart / deployment rollout |
-
-**Result:** each worker performs one startup schema fetch, then serves requests using
-its in-memory copy with no repeated schema fetch during normal request handling.
-
----
-
-### 11.2 LangGraph Thread State — Conversation Checkpointer
+### 11.1 LangGraph Thread State — Conversation Checkpointer
 
 **Current State:** v1 already uses a Redis-backed LangGraph
 checkpointer. The same shared Redis infrastructure and existing checkpointer
@@ -1735,11 +1660,10 @@ sequenceDiagram
 
 ---
 
-### 11.3 Cache Hierarchy Summary
+### 11.2 Cache Hierarchy Summary
 
 | Cache | Owner | Storage | Namespace / Scope | What it prevents |
 |---|---|---|---|---|
-| Static schema cache | careers-ai-service | Worker memory | Process-local (per worker) | Repeat schema fetches during request handling on the same worker |
 | Thread state (checkpointer) | careers-ai-service | Redis | `langgraph:v2:checkpoint:*` | Lost conversation context across workers and pods |
 ---
 
@@ -1979,12 +1903,15 @@ dependency at any hop. All secrets managed via Akeyless Vault.
 
 **Decision:** `candidate-mcp` takes `careers-data-schema` as a compile-time dependency,
 serialises the Java models to JSON Schema, and exposes them as MCP static resources.
-The Python agent embeds these in the LLM system prompt at startup.
+They are the authoritative
+contract for the shape of data returned by MCP tools, consumed by integration tests and
+developer tooling.
 
 **Alternatives considered:**
 - Maintain parallel Python Pydantic models → rejected: dual maintenance, silent drift risk.
 - OpenAPI spec → Python code generation → rejected: extra pipeline, still a separate artefact to synchronise.
-- No schema context for LLM → rejected: LLM hallucinates field names; tool call accuracy degrades.
+- Embed schemas in system prompts → rejected: inflates system-prompt token count with no current benefit.
+- Load schemas at Python startup → rejected: adds a startup network call and an 8N startup burst for no current consumer.
 
 **Consequence:** A `careers-data-schema` breaking change requires rebuilding and
 redeploying `candidate-mcp`. This is an intentional and auditable deployment gate.
@@ -2032,28 +1959,6 @@ same transport wrapper.
 
 ---
 
-### DD-07: Per-Worker In-Memory Cache for MCP Static Resource Startup
-
-**Decision:** Each Uvicorn worker fetches MCP static schema resources from
-`candidate-mcp` during its own `init_registry()` startup and stores them in
-process-local memory for the worker lifetime. No Redis cache or distributed lock is
-used for schema startup coordination.
-
-**Problem:** The agent needs agent context schema-grounded prompts without adding cross-process
-coordination complexity to the startup path.
-
-**Alternatives considered:**
-- Distributed lock + Redis schema cache → rejected: adds coordination logic and
-    operational coupling for data that is immutable for the worker lifetime.
-- On-demand schema fetch during request handling → rejected: adds request-time
-    latency and external dependency on the hot path.
-
-**Consequence:** Startup can generate parallel identical fetches (8 workers × N pods),
-which is accepted as deployment-time overhead. Normal request handling performs no
-schema fetches.
-
----
-
 ### DD-08: Circuit Breaker per Downstream Service
 
 **Decision:** Three independent Resilience4j circuit breakers — one each for
@@ -2075,9 +1980,7 @@ assistant can still answer application status queries without job details.
 | ID | Issue / Risk | Severity | Owner | Status |
 |---|---|---|---|---|
 | R-01 | `langchain-mcp-adapters` does not natively support custom per-request header injection. The `SignatureProvider` must wrap or patch the httpx transport layer. Verify compatibility with `langchain-mcp-adapters 0.1.x`. Same httpx transport patch also enables shared connection pool for TLS reuse. | High | Dev team | Open — spike required |
-| R-02 | Deployment-time startup burst: workers fetch static schemas in parallel (8N pattern) during rolling restarts, potentially spiking `candidate-mcp` briefly. This does not affect steady-state request latency but should be load-tested. | Low | Dev team | Accepted |
-| R-03 | Embedding all schema resources in the LLM system prompt consumes context window tokens. Impact to be measured in staging. | Low | Dev team | Open |
-| R-04 | v1 and v2 graphs share no state. A user switching between `/api/v1` and `/api/v2` endpoints within the same session will lose conversation context. Cross-version thread continuity is not supported and must be communicated to consumers. | Low | Dev team | Accepted for now |
+| R-02 | v1 and v2 graphs share no state. A user switching between `/api/v1` and `/api/v2` endpoints within the same session will lose conversation context. Cross-version thread continuity is not supported and must be communicated to consumers. | Low | Dev team | Accepted for now |
 
 ---
 
