@@ -361,7 +361,7 @@ concerns any of the following:
 All tools are served by `candidate-mcp`. The sub-assistant has access to various **8 tools** across
 three domains. The **Job** tool is used to enrich
 application context: every application carries a `jobId`, so the assistant fetches job details
-(title, location, required assessment code, shift) to give the candidate meaningful context
+(title, status, location, required assessment code, shift) to give the candidate meaningful context
 alongside their application status.
 
 | Domain | Tool | How it is used by post_apply_assistant |
@@ -373,7 +373,7 @@ alongside their application status.
 | | `getApplicationDetails` | Current stage, days in stage, workflow history, metadata |
 | | `getAtsApplications` | All the raw post-apply applications list (PII striped) |
 | | `getApplicationGroups` | All the raw pre-apply applications list (PII striped) |
-| **Job** (1 tool) | `getJobDetails` | Enriches application context: resolves `jobId` → job title, location, required assessment code, job type, shift |
+| **Job** (1 tool) | `getJobDetails` | Enriches application context: resolves `jobId` → job title, status, location, required assessment code, job type, shift |
 
 **Total**: 8 tools
 
@@ -390,7 +390,7 @@ sequenceDiagram
     note over PAA: applications contains jobId → enrich
 
     PAA->>CMCP: getJobDetails(jobIds)
-    CMCP-->>PAA: { title, location, requiredAssessmentCode, shift }
+    CMCP-->>PAA: { title, status, location, requiredAssessmentCode, shift }
 
     note over PAA: now has full context to answer<br/>"Where is this job?", "What assessments<br/>are required?", "What is the job title?"
 ```
@@ -411,7 +411,7 @@ internal metadata ever reaches the agents or the LLM.
 |---|---|---|
 | `talent-profile-service` | `getTalentProfile`, `getPreferences`, `getAssessmentResults` | Candidate profiles, questionnaire responses, assessment results and preferences |
 | `cx-applications` | `getActionableApplications`, `getApplicationDetails`, `getAtsApplications`, `getApplicationGroups` | Application documents, stage history, statuses |
-| `job-sync-service` | `getJobDetails` | Job requisition details — title, location, assessment codes, job type, shift details |
+| `job-sync-service` | `getJobDetails` | Job requisition details — title, status, location, assessment codes, job type, shift details |
 
 #### Package Structure
 
@@ -501,7 +501,7 @@ type is calling it. Every tool handler maps the raw downstream response to a pro
 |---|---|
 | Profile | Candidate ID, display name, Assessment results with status details |
 | Application | Application ID, job ID, status enums, current stage name, days in current stage, SLA, stage history, ats source |
-| Job | Job ID, title, job type, location, shift details |
+| Job | Job ID, title, status, job type, location, shift details |
 
 ```mermaid
 flowchart LR
@@ -619,7 +619,7 @@ graph = StateGraph(
 
 **Rationale**:
 - Prevents infinite loops and runaway requests
-- 15 iterations = approximately 3-4 tool calls with reasonable reasoning steps
+- 25 iterations = approximately 5-6 tool calls with reasonable reasoning steps
 - Industry standard for production LLM agents
 - Provides multiple layers of protection (graph-level, API-level, application-level)
 
@@ -725,7 +725,7 @@ The agent follows these convergence patterns to ensure it stops when sufficient 
 
 | Condition | Example |
 |---|---|
-| Sufficient data collected to answer query | User asks "What's my application status?" → `getApplicationStatus()` returns complete status → STOP (don't call `getAssessmentResults()` unless asked) |
+| Sufficient data collected to answer query | User asks "What's my application status?" → `getApplicationDetails()` returns complete status → STOP (don't call `getAssessmentResults()` unless asked) |
 | Last tool call returned complete information | `getActionableApplications()` returns full list → STOP (don't call `getJobDetails()` for each unless user asks for job details) |
 | Tool call count reaches limit (10) | Agent has called 10 tools → return helpful message asking user to rephrase |
 | Recursion limit reached (25 iterations) | Graph hits 25 iterations → hard stop with timeout error |
@@ -902,7 +902,7 @@ stripped (PII, internal metadata, database artefacts) are not present.
 |---|---|---|
 | `ats://schema/profile` | `TalentProfileV2` | Assessment results, experience summary, questionnaire responses — no raw contact details |
 | `ats://schema/application` | `AtsApplication` | Stage, status enum, history, metadata — no internal fields |
-| `ats://schema/job` | `JobRequisition` | Title, location, job type, shift details — no internal fields |
+| `ats://schema/job` | `JobRequisition` | Title, status, location, job type, shift details — no internal fields |
 | `ats://schema/application-stages` | `ApplicationStage` | Enum of all possible application stages with descriptions — no internal fields |
 
 ---
@@ -963,7 +963,7 @@ sequenceDiagram
 
     PAA->>CMCP: getJobDetails([jobIds]) + WM-AUTH-SIGNATURE
     CMCP->>CXA: GET /v1/unified-bulk-job-details?jobIds={jobIds}
-    CXA-->>CMCP: List~JobRequisitionDto~ (title, location, job type)
+    CXA-->>CMCP: List~JobRequisitionDto~ (title, status, location, job type)
     CMCP-->>PAA: JSON
 
     note over PAA: LLM synthesises empathetic<br/>response from tool outputs
@@ -982,7 +982,7 @@ sequenceDiagram
     participant CMCP as candidate-mcp
     participant TPS as talent-profile-service
 
-    User->>API: POST /invoke {"message": "Show me the candidate's skills and assessment scores"}
+    User->>API: POST /invoke {"message": "What is my assessment score?"}
     API->>PA: ainvoke(AgentState)
 
     note over PA: Profile/assessment intent detected
@@ -991,14 +991,9 @@ sequenceDiagram
 
     API->>PAA: ainvoke(AgentState)
 
-    PAA->>CMCP: getTalentProfile(talentProfileId)
-    CMCP->>TPS: GET /v1/candidates/{id}/profile
-    TPS-->>CMCP: CandidateProfileDto
-    CMCP-->>PAA: JSON
-
     PAA->>CMCP: getAssessmentResults(talentProfileId)
-    CMCP->>TPS: GET /v1/candidates/{id}/assessments
-    TPS-->>CMCP: List~AssessmentResultDto~
+    CMCP->>TPS: GET /v2/profile
+    TPS-->>CMCP: Profile with List~AssessmentResultDto~
     CMCP-->>PAA: JSON
 
     PAA-->>API: AIMessage
@@ -1021,8 +1016,8 @@ sequenceDiagram
     Graph-->>API: on_chain_start {name: post_apply_assistant}
     API-->>User: event: handoff {from: primary, to: post_apply}
 
-    Graph-->>API: on_tool_start {name: getApplicationStatus}
-    API-->>User: event: tool_call {name: getApplicationStatus}
+    Graph-->>API: on_tool_start {name: getApplicationDetails}
+    API-->>User: event: tool_call {name: getApplicationDetails}
 
     CMCP-->>Graph: tool result
     Graph-->>API: on_tool_end
@@ -1049,10 +1044,10 @@ sequenceDiagram
     Tool->>CB: check state
     alt Circuit CLOSED
         CB->>Retry: execute with retry
-        Retry->>Client: getStatus(atsRequisitionId)
-        Client->>CXA: GET /v1/applications/{id}/status
+        Retry->>Client: getApplicationDetails(applicationDocumentId)
+        Client->>CXA: GET /v1/applications/{id}
         alt Success
-            CXA-->>Client: 200 ApplicationStatusDto
+            CXA-->>Client: 200 ApplicationDetailsDto
             Client-->>Tool: DTO → JSON string
         else Transient failure (5xx / timeout)
             CXA-->>Client: 503
@@ -1078,8 +1073,8 @@ sequenceDiagram
 `candidate-mcp` uses **stateless streamable HTTP**. This means `langchain-mcp-adapters`
 creates a new HTTP session (including a full TLS handshake) for every individual tool
 call. A typical `post_apply_assistant` workflow makes 3–5 tool calls in a single
-user request (e.g. `getActionableApplications` → `getJobDetails` → `getApplicationStatus` →
-`getNextSteps` → `getInterviewFeedback`), resulting in 3–5 consecutive TLS handshakes.
+user request (e.g. `getActionableApplications` → `getJobDetails` → `getApplicationDetails` →
+`getAssessmentResults` → `getPreferences`), resulting in 3–5 consecutive TLS handshakes.
 
 Without mitigation, this adds ~50–150ms of unnecessary overhead per tool call and
 saturates the TCP connection pool.
@@ -1105,7 +1100,7 @@ sequenceDiagram
 
     PAA->>MCP: TCP SYN + TLS ClientHello (tool call 3)
     MCP-->>PAA: TLS ServerHello + cert + Finished
-    PAA->>MCP: getApplicationStatus → result
+    PAA->>MCP: getApplicationDetails → result
     note over PAA,MCP: connection closed
 ```
 
@@ -1133,7 +1128,7 @@ sequenceDiagram
     POOL->>MCP: getJobDetails → result  (no new handshake)
 
     PAA->>POOL: acquire connection (reused)
-    POOL->>MCP: getApplicationStatus → result  (no new handshake)
+    POOL->>MCP: getApplicationDetails → result  (no new handshake)
 ```
 
 **Implementation approach:**
@@ -1144,21 +1139,19 @@ A shared `httpx.AsyncClient` instance (not created per-call) is configured in th
 | Configuration | Value | Reason |
 |---|---|---|
 | `http2=True` | Enabled | HTTP/2 multiplexes tool calls over a single connection; eliminates TCP overhead entirely for concurrent calls |
-| `limits.max_keepalive_connections` | 5 | One per `candidate-mcp` replica; supports load-balanced round-robin |
 | `limits.keepalive_expiry` | 30s | Prevents stale connections; matches Kubernetes service mesh idle timeout |
 | `verify` | CA bundle path | Validates `candidate-mcp` TLS certificate against internal CA |
 | TLS session tickets | Enabled by default in httpx | `candidate-mcp` returns a `Session-Ticket` on first handshake; subsequent reconnects reuse it, skipping full certificate exchange |
 
 **candidate-mcp — keep-alive configuration:**
 
-Spring Boot's embedded Tomcat must be configured to hold connections open long enough
-for the agent to reuse them.
+On the Spring MCP side, keep-alive settings are tuned to allow connection reuse while preventing stale connections:
 
 | Property | Value | Reason |
 |---|---|---|
-| `server.tomcat.connection-timeout` | `20s` | How long Tomcat waits for a new request on a kept-alive connection |
-| `server.tomcat.keep-alive-timeout` | `15s` | Slightly below the agent's 30s expiry to avoid race conditions |
-| `server.tomcat.max-keep-alive-requests` | `100` | Maximum requests on one connection before forcing a new one |
+| `server.connection-timeout` | `20s` | How long server waits for a new request on a kept-alive connection |
+| `server.keep-alive-timeout` | `15s` | Slightly below the agent's 30s expiry to avoid race conditions |
+| `server.max-keep-alive-requests` | `100` | Maximum requests on one connection before forcing a new one |
 
 **Result:** a `post_apply_assistant` workflow making 4 tool calls to the same
 `candidate-mcp` pod performs **one TLS handshake** (on the first call) and
@@ -1194,32 +1187,23 @@ unseen pod is first established.
 
 | Tool | Endpoint |
 |---|---|
-| `getTalentProfile` | `GET /v1/candidates/{id}/profile` |
-| `getSkillsGap` | `GET /v1/candidates/{id}/skills-gap?jobId={jobId}` |
-| `getAssessmentResults` | `GET /v1/candidates/{id}/assessments` |
-| `getAssessmentByType` | `GET /v1/candidates/{id}/assessments?type={type}` |
-| `compareToPercentile` | `GET /v1/candidates/{id}/assessments/percentile` |
+| `getTalentProfile` | `GET /v2/profile?talentProfileId={talentProfileId}` |
+| `getAssessmentResults` | `GET /v2/profile?talentProfileId={talentProfileId}` |
+| `getPreferences` | `GET /v2/profile?talentProfileId={talentProfileId}` |
 
 **cx-applications** — application status and workflow history
 
 | Tool | Endpoint |
 |---|---|
-| `getApplicationStatus` | `GET /v1/applications/{id}/status` |
-| `getActionableApplications` | `GET /v1/applications?talentProfileId={id}` |
-| `getCandidateJourney` | `GET /v1/candidates/{id}/journey` |
-| `getNextSteps` | `GET /v1/applications/{id}/next-steps` |
-| `getStageDuration` | `GET /v1/applications/{id}/stage-duration` |
-| `getInterviewFeedback` | `GET /v1/applications/{id}/interviews` |
+| `getApplicationDetails` | `GET /v2/applications/{applicationDocumentId}` |
+| `getActionableApplications` | `GET /v2/applications?talentProfileId={talentProfileId}` |
+
 
 **job-sync-service** — job requisition details
 
 | Tool | Endpoint |
 |---|---|
-| `getJobDetails` | `GET /v1/jobs/{id}` — returns title, location, department, job type, required assessment codes, and requisition status |
-
-> `job-sync-service` is an existing service. `candidate-mcp` calls it via a new
-> `JobSyncClient` (WebClient + circuit breaker). The v1 primary assistant's existing
-> direct HTTP calls to `job-sync-service` are a separate connection and are unaffected.
+| `getJobDetails` | `GET /v1/bulkUnifiedJobDetails?jobIds={jobIds}` — returns title, location, job type, required assessment codes, and requisition status |
 
 ---
 
@@ -1228,7 +1212,7 @@ unseen pod is first established.
 All service-to-service authentication uses **App2App HMAC-SHA256 signature auth**.
 The same mechanism applies to both hops:
 `careers-ai-service` → `candidate-mcp` and `candidate-mcp` → downstream services.
-Each hop uses independently registered app IDs and shared secrets.
+Each hop uses independently registered app IDs and secrets.
 
 ### 8.1 App2App Signature Auth — careers-ai-service to candidate-mcp
 
@@ -1237,74 +1221,29 @@ and validated by the receiver.
 
 #### Signature Header Contract
 
-Each MCP request from `careers-ai-service` carries three additional HTTP headers:
+Each MCP request from `careers-ai-service` carries additional HTTP headers:
 
 | Header | Content |
 |---|---|
-| `X-App-Id` | Registered caller identifier (e.g. `careers-ai-service-prod`) |
-| `X-Timestamp` | UTC Unix epoch seconds at signing time |
-| `X-Signature` | `HMAC-SHA256(shared_secret, X-App-Id + ":" + X-Timestamp + ":" + request_path)` hex-encoded |
-
-#### Signature Flow
-
-```mermaid
-sequenceDiagram
-    participant Agent as careers-ai-service (SignatureProvider)
-    participant MCP as candidate-mcp (SignatureFilter)
-    participant SR as ServiceRegistry (in-memory / Redis)
-
-    Agent->>Agent: compute signature (app_id + timestamp + path)
-    Agent->>MCP: POST /mcp + X-App-Id, X-Timestamp, X-Signature
-
-    MCP->>SR: lookup(app_id) → secret + ttl_seconds
-    SR-->>MCP: shared_secret, ttl=300
-
-    MCP->>MCP: verify: now - X-Timestamp ≤ ttl_seconds
-    MCP->>MCP: verify: HMAC-SHA256(secret, payload) == X-Signature
-
-    alt Valid
-        MCP-->>Agent: 200 tool response
-    else Expired (replay attack window exceeded)
-        MCP-->>Agent: 401 SIGNATURE_EXPIRED
-    else Invalid signature
-        MCP-->>Agent: 401 SIGNATURE_INVALID
-    end
-```
+| `WM_CONSUMER_ID` | Registered caller identifier |
+| `WM_SVC_ENV` | Registered caller environment |
+| `WM_AUTH_SIGNATURE` | HMAC-SHA256 signature of the request |
+| `WM_TIMESTAMP` | UTC Unix epoch seconds at signing time |
 
 #### Service Registry — Signature TTL Configuration
 
-`candidate-mcp` maintains a **Service Registry** that maps each registered caller to
-its shared secret and optional TTL override. The default TTL is 5 minutes.
-
-| Field | Description |
-|---|---|
-| `app_id` | Unique caller identifier |
-| `shared_secret` | Secret used to verify the HMAC |
-| `ttl_seconds` | Signature validity window. Default: `300` (5 min). Can be reduced per client for higher-security environments. |
-| `enabled` | If false, all requests from this app ID are rejected without verification |
-
-```mermaid
-flowchart LR
-    SR["Service Registry ──────────────────── app_id → secret + ttl stored in application.yml or external config (Vault / K8s Secret)"]
-    SF["SignatureFilter (Spring OncePerRequestFilter)"]
-    REQ["Inbound MCP request"]
-
-    REQ --> SF
-    SF -->|"lookup app_id"| SR
-    SR -->|"secret + ttl"| SF
-    SF -->|"HMAC verify + TTL check"| REQ
-```
+`candidate-mcp` maintains the service registry that maps each registered caller to
+its shared secret and optional TTL override. The default TTL is 5 minutes if App2App authentication is enabled.
 
 #### Python — SignatureProvider
 
 `careers-ai-service` wraps the `MultiServerMCPClient` with a `SignatureProvider` that
-injects the three signature headers into every outgoing MCP HTTP request. The
-provider reads `APP_ID` and `APP_SECRET` from the environment.
+injects the three signature headers into every outgoing MCP HTTP request.
 
 ```mermaid
 flowchart LR
     PAA["post_apply_assistant tool call"]
-    SP["SignatureProvider ──────────────────── reads APP_ID, APP_SECRET computes HMAC-SHA256 injects X-* headers"]
+    SP["SignatureProvider ──────────────────── computes HMAC-SHA256 injects WM_* headers"]
     MC["MultiServerMCPClient (httpx transport)"]
     CMCP["candidate-mcp /mcp"]
 
@@ -1318,23 +1257,23 @@ flowchart LR
 ### 8.2 App2App Signature Auth — candidate-mcp to Downstream Services
 
 `candidate-mcp` uses the same HMAC-SHA256 signature scheme when calling downstream
-services. Each downstream service registers `candidate-mcp` as a trusted `app_id`
+services. Each downstream service registers `candidate-mcp` as a trusted `consumer_id`
 in its own Service Registry. A `SignatureProvider` in `candidate-mcp` computes and
-injects `X-App-Id`, `X-Timestamp`, and `X-Signature` on every outbound REST call.
+injects `WM_*` headers on every outbound REST call.
 
 ```mermaid
 flowchart LR
     subgraph "candidate-mcp"
-        SP["SignatureProvider computes HMAC-SHA256 injects X-* headers"]
+        SP["SignatureProvider computes HMAC-SHA256 injects WM_* headers"]
         PT["ProfileTools"]
         AT["ApplicationTools"]
         JT["JobTools"]
         PT & AT & JT --> SP
     end
 
-    TPS["talent-profile-service (validates X-App-Id/Signature)"]
-    CXA["cx-applications (validates X-App-Id/Signature)"]
-    JSS["job-sync-service (validates X-App-Id/Signature)"]
+    TPS["talent-profile-service (validates WM_* headers)"]
+    CXA["cx-applications (validates WM_* headers)"]
+    JSS["job-sync-service (validates WM_* headers)"]
 
     SP -->|"REST + App2App Signature"| TPS
     SP -->|"REST + App2App Signature"| CXA
@@ -1349,10 +1288,9 @@ flowchart LR
 |---|---|
 | **App2App — no shared user context** | The agent-to-MCP hop is machine-to-machine. No user bearer token is forwarded through the agent. |
 | **Replay attack prevention** | Signature TTL (default 5 min) prevents reuse of a captured signature. Clock skew tolerance is not added — clocks must be synchronised (NTP). |
-| **Per-client TTL control** | High-sensitivity deployments can reduce TTL below 5 min at the service registry level without redeploying the agent. |
-| **Least privilege (downstream)** | Each downstream service registers `candidate-mcp` with its own app_id and independent shared secret. Secrets are never shared across services. |
-| **No secrets in code** | App secret (`APP_SECRET`) injected via Kubernetes `Secret` → env variable. MCP service registry secrets stored in Vault or K8s Secrets, never in `application.yml`. |
-| **MCP endpoint hardened** | `/mcp/**` requires a valid App2App signature. `/actuator/health/**` is public for probe access only. |
+| **Least privilege (downstream)** | Each downstream service registers `candidate-mcp` with its own consumer_id and independent shared secret. Secrets are never shared across services. |
+| **No secrets in code** | Key secret (`CONSUMER_PRIVATE_KEY`) injected via Akeyless `Secret` → env variable. MCP service registry secrets stored in Akeyless Vault, never in `application.yml`. |
+| **MCP endpoint hardened** | `/mcp/**` requires a valid App2App signature. `/health/**` is public for probe access only. |
 
 ---
 
@@ -1360,7 +1298,7 @@ flowchart LR
 
 ### 9.1 Circuit Breaker — State Machine
 
-One circuit breaker per downstream service, independently tripped. A failure in
+One circuit breaker per downstream service, independently tripped. An unavailability in
 `cx-applications` does not affect `talent-profile-service` or `job-sync-service`
 calls. Three circuit breakers in total: one per service.
 
@@ -1377,7 +1315,7 @@ stateDiagram-v2
 
 | Parameter | Value | Applies To |
 |---|---|---|
-| Max attempts | 3 | All downstream services |
+| Max attempts | 3 total attempts (1 initial + 2 retries) | All downstream services |
 | Wait between retries | 200ms | All downstream services |
 | Retry on | 5xx, connection timeout | Network / server errors |
 | Do not retry | 4xx | Client errors (not found, access denied) |
@@ -1386,7 +1324,7 @@ stateDiagram-v2
 
 | Layer | Timeout | Purpose |
 |---|---|---|
-| MCP tool handler total | 10s | LLM tool call budget |
+| MCP tool handler total | 30s | LLM tool call budget |
 | WebClient response | 5s | Per downstream HTTP call |
 | WebClient connect | 2s | TCP connection establishment |
 
@@ -1404,11 +1342,10 @@ hallucinating data or producing an error trace.
 Production observability uses a **three-layer stack**:
 
 - **Langfuse**: LLM tracing, cost tracking, prompt management, user feedback
-- **Prometheus**: Service metrics, SLOs, alerting
-- **OpenObserve**: Application logs, structured logging, dashboards
+- **MMS (Prometheus, Grafana)**: Service metrics, SLOs, alerting
+- **MLS (OpenObserve)**: Application logs, structured logging, dashboards, alerts
 
-This section describes the comprehensive observability strategy validated through
-implementation implementation and production deployment planning.
+This section describes the comprehensive observability strategy: what is tracked at each layer, how they integrate, and how they enable proactive monitoring and debugging of the agent in production.
 
 ---
 
@@ -1417,15 +1354,15 @@ implementation implementation and production deployment planning.
 ```mermaid
 flowchart TD
     subgraph "Layer 1: LLM Observability"
-        LF["Langfuse ──────────────────── • Trace every LLM call • Track token usage & cost • Session tracking • User feedback collection • Prompt versioning"]
+        LF["Langfuse • Trace every LLM call • Track token usage & cost • Session tracking • User feedback collection • Prompt versioning"]
     end
 
     subgraph "Layer 2: Service Metrics"
-        PROM["Prometheus ──────────────────── • Request rates • Latency P50/P95/P99 • Tool call metrics • Circuit breaker state • SLO tracking"]
+        PROM["MMS • Golden signals (error rates, latency, throughput) • Tool call metrics • Circuit breaker state • SLO tracking"]
     end
 
     subgraph "Layer 3: Application Logs"
-        OO["OpenObserve ──────────────────── • Structured logs • Strategic log events • Alert rules • Production dashboards"]
+        OO["MLS • Structured logs • Strategic log events • Alert rules • Production dashboards"]
     end
 
     subgraph "Services"
@@ -1478,40 +1415,18 @@ final_state = await graph.ainvoke(input_state, config=config)
 Langfuse automatically tracks:
 - **Per-request cost** (prompt + completion tokens × model pricing)
 - **Session-level cost** (multi-turn conversation total)
-- **Per-candidate cost** (grouped by `user_id`)
+- **Per-candidate cost** (grouped by `talent_profile_id`)
 - **Model usage breakdown** (cost by model type)
 
-**Custom cost calculation** for local/self-hosted LLMs:
-```python
-def calculate_custom_model_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    CUSTOM_MODEL_PRICING = {
-        "openai/gpt-oss-20b": {"prompt": 0.50, "completion": 1.50},  # Per 1M tokens
-    }
-    pricing = CUSTOM_MODEL_PRICING.get(model, {"prompt": 0, "completion": 0})
-    return (prompt_tokens / 1_000_000) * pricing["prompt"] + (completion_tokens / 1_000_000) * pricing["completion"]
-```
+This enables monitoring of LLM costs at a granular level, identifying expensive queries, and optimizing prompts or tool usage to reduce costs.
 
 #### C. User Feedback Integration
 
-**Feedback endpoint** allows candidates to rate agent responses:
-
-```python
-@router.post("/api/v2/agent/feedback")
-async def submit_feedback(trace_id: str, score: float, comment: str | None = None):
-    """
-    Args:
-        trace_id: Langfuse trace ID from response
-        score: -1.0 (thumbs down), 0.0 (neutral), 1.0 (thumbs up)
-        comment: Optional feedback text
-    """
-    client = Langfuse()
-    client.score(trace_id=trace_id, name="user_feedback", value=score, comment=comment)
-    return {"status": "success"}
-```
-
-**Use case**: Frontend displays thumbs up/down buttons, sends feedback to this endpoint
+Not part of the initial implementation, but might be added in the future: a feedback endpoint that the frontend can call to send thumbs up/down feedback on the agent's response quality.
 
 #### D. Prompt Management
+
+Not implemented in the initial version, but the system is designed to support
 
 **Centralized prompt versioning** in Langfuse UI:
 - Store system prompts in Langfuse (version-controlled)
@@ -1527,17 +1442,14 @@ async def submit_feedback(trace_id: str, score: float, comment: str | None = Non
 | **Cost per trace** | LLM cost for one user request | > $0.50 (expensive query) |
 | **Tool call patterns** | Most frequently used tools | - |
 | **Error rate** | Percentage of failed requests | > 5% for 10 min |
-| **User feedback score** | Average thumbs up/down | < 0.6 (low satisfaction) |
 | **Session duration** | Multi-turn conversation length | - |
 | **Token usage trend** | Prompt + completion tokens over time | - |
 
 ---
 
-### 10.3 Prometheus: Service Metrics & SLOs
+### 10.3 MMS (Managed Metrics Service): Service Metrics & SLOs
 
 #### A. Python Agent Metrics (careers-ai-service)
-
-**Exposed at**: `http://localhost:8000/metrics`
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
@@ -1548,59 +1460,9 @@ async def submit_feedback(trace_id: str, score: float, comment: str | None = Non
 | `agent_handoff_total` | Counter | `from_agent`, `to_agent` | Agent handoff events |
 | `mcp_connection_status` | Gauge | - | MCP connection health (1=up, 0=down) |
 | `mcp_tools_loaded` | Gauge | `agent_type` | Number of tools loaded |
-| `llm_tokens_total` | Counter | `token_type`, `model` | LLM tokens used (prompt/completion) |
-| `llm_cost_usd_total` | Counter | `model` | LLM cost in USD |
-
-**Implementation**:
-```python
-from prometheus_client import Counter, Histogram, Gauge
-
-agent_requests_total = Counter(
-    "agent_requests_total",
-    "Total agent requests",
-    ["agent_version", "agent_used", "status"]
-)
-
-agent_request_duration_seconds = Histogram(
-    "agent_request_duration_seconds",
-    "Agent request duration",
-    ["agent_version", "agent_used"],
-    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
-)
-
-# GUARDRAIL METRICS (NEW)
-agent_tool_calls_total = Counter(
-    "agent_tool_calls_total",
-    "Total tool calls by tool name",
-    ["tool_name", "talent_profile_id"]
-)
-
-tool_call_errors = Counter(
-    "agent_tool_call_errors_total",
-    "Tool call errors by tool name and error type",
-    ["tool_name", "error_type"]
-)
-
-agent_iterations_count = Histogram(
-    "agent_iterations_count",
-    "Number of iterations per request",
-    buckets=[1, 3, 5, 10, 15, 20, 25, 30]
-)
-
-agent_recursion_limit_hit_total = Counter(
-    "agent_recursion_limit_hit_total",
-    "Requests that hit recursion limit"
-)
-
-# Expose via FastAPI
-from prometheus_client import make_asgi_app
-metrics_app = make_asgi_app()
-app.mount("/metrics", metrics_app)
-```
+| `pa2_llm_tokens_total` | Counter | `token_type`, `model` | LLM tokens used (prompt/completion) |
 
 #### B. Java MCP Server Metrics (candidate-mcp)
-
-**Exposed at**: `http://localhost:8081/actuator/prometheus`
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
@@ -1613,141 +1475,9 @@ app.mount("/metrics", metrics_app)
 | `mcp.circuit_breaker.open.total` | Counter | `service` | Circuit breaker opens |
 | `resilience4j.circuitbreaker.state` | Gauge | `name` | Circuit state (0=closed, 1=open) |
 
-**Spring Boot Configuration**:
-```yaml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info,metrics,prometheus
-  metrics:
-    export:
-      prometheus:
-        enabled: true
-    tags:
-      application: candidate-mcp
-      environment: ${ENVIRONMENT:production}
-```
-
-#### C. Prometheus Alert Rules
-
-**File**: `prometheus/alert_rules.yml`
-
-```yaml
-groups:
-  - name: candidate_agent_alerts
-    interval: 30s
-    rules:
-      # High error rate
-      - alert: HighAgentErrorRate
-        expr: |
-          rate(agent_requests_total{status="error"}[5m]) /
-          rate(agent_requests_total[5m]) > 0.05
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Agent error rate > 5% for 5 minutes"
-
-      # Slow responses (P95 > 10s)
-      - alert: SlowAgentResponses
-        expr: |
-          histogram_quantile(0.95,
-            rate(agent_request_duration_seconds_bucket[5m])
-          ) > 10
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "P95 latency exceeds 10 seconds"
-
-      # MCP connection down
-      - alert: McpConnectionDown
-        expr: mcp_connection_status == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "MCP server connection lost"
-
-      # High LLM cost
-      - alert: HighLlmCost
-        expr: increase(llm_cost_usd_total[1h]) > 100
-        labels:
-          severity: warning
-        annotations:
-          summary: "LLM cost exceeds $100 in 1 hour"
-
-      # Circuit breaker open
-      - alert: CircuitBreakerOpen
-        expr: resilience4j_circuitbreaker_state{state="open"} == 1
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Circuit breaker opened for downstream service"
-
-      # High downstream latency
-      - alert: HighDownstreamLatency
-        expr: |
-          histogram_quantile(0.95,
-            rate(mcp_downstream_duration_seconds_bucket[5m])
-          ) > 5
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "P95 downstream latency > 5s"
-
-      # GUARDRAIL ALERTS (NEW)
-
-      # Excessive tool calls
-      - alert: AgentExcessiveToolCalls
-        expr: rate(agent_tool_calls_total[5m]) > 50
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Agent making excessive tool calls"
-          description: "Tool call rate {{ $value }} calls/sec exceeds threshold"
-
-      # Recursion limit hits
-      - alert: AgentRecursionLimitHit
-        expr: increase(agent_recursion_limit_hit_total[5m]) > 5
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Multiple requests hitting recursion limit"
-          description: "{{ $value }} requests hit recursion limit in last 5 minutes"
-
-      # Tool call errors
-      - alert: AgentToolCallErrors
-        expr: rate(agent_tool_call_errors_total[5m]) > 0.1
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High tool call error rate"
-          description: "Error rate {{ $value }} errors/sec for tool {{ $labels.tool_name }}"
-
-      # High iteration count
-      - alert: AgentHighIterationCount
-        expr: |
-          histogram_quantile(0.95,
-            rate(agent_iterations_count_bucket[5m])
-          ) > 20
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "P95 iteration count approaching recursion limit"
-          description: "Agent averaging {{ $value }} iterations per request"
-```
-
 ---
 
-### 10.4 OpenObserve: Application Logs & Alerting
+### 10.4 MLS (Managed Log Search): Application Logs & Alerting
 
 #### A. Strategic Logging Points — Python Agent
 
@@ -1761,26 +1491,8 @@ groups:
 | `agent_invoke_complete` | INFO | `agent_used`, `tool_calls`, `duration_ms` | If `duration_ms > 30000` |
 | `agent_invoke_error` | ERROR | `error`, `error_type`, `stack_trace` | Immediate |
 | `mcp_connection_failed` | CRITICAL | `error`, `mcp_url`, `retry_attempt` | Immediate |
-| `llm_call_complete` | INFO | `model`, `prompt_tokens`, `cost_usd`, `duration_ms` | If `cost_usd > 1.0` |
-| `user_feedback_received` | INFO | `trace_id`, `score`, `has_comment` | - |
+| `pa2_llm_call_complete` | INFO | `model`, `prompt_tokens`, `cost_usd`, `duration_ms` | If `cost_usd > 1.0` |
 | `circuit_breaker_opened` | CRITICAL | `service`, `failure_rate` | Immediate |
-
-**Implementation**:
-```python
-import structlog
-
-logger = structlog.get_logger(__name__)
-
-# Example: Log tool call with timing
-with tool_call_span("getTalentProfile", {"talentProfileId": "C001"}):
-    result = await tool.ainvoke(args)
-    logger.info(
-        "mcp_tool_call_complete",
-        tool_name="getTalentProfile",
-        duration_ms=duration_ms,
-        status="success"
-    )
-```
 
 #### B. Strategic Logging Points — Java MCP Server
 
@@ -1790,25 +1502,12 @@ with tool_call_span("getTalentProfile", {"talentProfileId": "C001"}):
 | `tool_completed` | INFO | `tool`, `duration_ms`, `result_size_bytes` | If `duration_ms > 5000` |
 | `tool_error` | ERROR | `tool`, `error`, `trace_id` | Immediate |
 | `transformation_complete` | INFO | `transformer`, `duration_ms`, `fields_stripped` | - |
-| `pii_violation_detected` | CRITICAL | `transformer`, `field`, `value_hash` | **Immediate + page on-call** |
 | `downstream_call_complete` | INFO | `service`, `endpoint`, `status_code`, `duration_ms` | If `status_code >= 500` |
 | `downstream_call_error` | ERROR | `service`, `endpoint`, `error`, `retry_attempt` | If 3+ failures in 5 min |
 | `circuit_breaker_opened` | CRITICAL | `service`, `failure_rate`, `call_count` | Immediate |
 | `sla_breach_detected` | WARN | `ats_requisition_id`, `stage`, `days_in_stage`, `threshold` | If count > 10 in 1 hour |
 | `mcp_request_received` | INFO | `x_correlation_id`, `x_talent_profile_id`, `method` | - |
 | `mcp_response_sent` | INFO | `x_correlation_id`, `status`, `duration_ms` | If `duration_ms > 10000` |
-
-**Implementation**:
-```java
-import org.slf4j.Logger;
-import org.slf4j.MDC;
-
-MDC.put("tool", toolName);
-MDC.put("talent_profile_id", talentProfileId);
-MDC.put("trace_id", traceId);
-log.info("tool_called args_hash={}", hashArgs(args));
-MDC.clear();
-```
 
 #### C. Production Dashboards
 
@@ -1819,7 +1518,7 @@ Panels:
 2. **P50/P95/P99 Latency** — Latency distribution over time
 3. **Error Rate** — Percentage of failed requests (gauge)
 4. **Top Tools Used** — Bar chart of most frequently called tools
-5. **LLM Cost** — Cumulative cost over time
+5. **PA2 LLM Cost** — Cumulative cost over time
 6. **Tool Call Heatmap** — Usage patterns by hour of day
 
 **Dashboard 2: MCP Server Health**
@@ -1829,54 +1528,14 @@ Panels:
 2. **Downstream Service Latency** — Average latency by service
 3. **Circuit Breaker Status** — Open/closed status per service
 4. **Transformation Performance** — Average duration by transformer
-5. **PII Violations** — Counter (should be 0 always)
 
 **Dashboard 3: User Experience & SLOs**
 
 Panels:
 1. **SLO Compliance** — % of requests < 10s (target: 95%)
-2. **User Feedback Trends** — Average feedback score over time
-3. **SLA Breaches** — Count of applications exceeding stage thresholds
-4. **Session Duration** — Distribution of multi-turn conversation lengths
-5. **Multi-Turn Conversations** — % of sessions with > 1 turn
-
-#### D. OpenObserve Alert Rules
-
-```json
-{
-  "alerts": [
-    {
-      "name": "critical_agent_error_rate",
-      "query": "count(agent_invoke_error) / count(agent_invoke_start) * 100 > 10",
-      "duration": "5m",
-      "severity": "critical",
-      "notification": ["slack_oncall", "pagerduty"]
-    },
-    {
-      "name": "pii_violation_detected",
-      "query": "count(pii_violation_detected) > 0",
-      "duration": "1m",
-      "severity": "critical",
-      "notification": ["slack_security", "pagerduty"],
-      "description": "PII data detected in transformer output - IMMEDIATE ACTION REQUIRED"
-    },
-    {
-      "name": "circuit_breaker_open",
-      "query": "count(circuit_breaker_opened) > 0",
-      "duration": "2m",
-      "severity": "critical",
-      "notification": ["slack_oncall"]
-    },
-    {
-      "name": "excessive_sla_breaches",
-      "query": "count(sla_breach_detected) > 50",
-      "duration": "1h",
-      "severity": "warning",
-      "notification": ["slack_recruiting"]
-    }
-  ]
-}
-```
+2. **SLA Breaches** — Count of applications exceeding stage thresholds
+3. **Session Duration** — Distribution of multi-turn conversation lengths
+4. **Multi-Turn Conversations** — % of sessions with > 1 turn
 
 ---
 
@@ -1889,7 +1548,7 @@ flowchart LR
     MC["MCP HTTP call (httpx instrumented)"]
     JV["candidate-mcp (Micrometer + OTel)"]
     DS["Downstream Service"]
-    COLL[("OTLP Collector → Jaeger / Tempo")]
+    COLL[("OTLP Collector → TraceStore")]
 
     CL -->|"traceparent"| PY
     PY -->|"traceparent injected by httpx"| MC
@@ -1900,36 +1559,8 @@ flowchart LR
 ```
 
 A `correlation_id` is generated at the API layer, carried in `AgentState`, and
-included in every structured log record throughout the Python process. The W3C
-`traceparent` header carries the trace across service boundaries into the Java layer.
-
----
-
-### 10.6 Implementation Roadmap
-
-**Phase 1: Foundation (Week 1)**
-- ✅ Basic Langfuse integration (already done)
-- 🔲 Enhanced Langfuse with session tracking and metadata
-- 🔲 Prometheus metrics endpoints (Python + Java)
-- 🔲 Basic structured logging (correlation IDs, candidate IDs)
-
-**Phase 2: Comprehensive Instrumentation (Week 2)**
-- 🔲 All strategic log events implemented
-- 🔲 Prometheus alert rules configured
-- 🔲 OpenObserve dashboards created
-- 🔲 Tool call metrics tracking
-
-**Phase 3: Advanced Features (Week 3)**
-- 🔲 Langfuse prompt management integration
-- 🔲 Dataset creation from production traces
-- 🔲 User feedback collection endpoint
-- 🔲 Cost tracking and optimization
-
-**Phase 4: Production Hardening (Week 4)**
-- 🔲 Alert rule tuning based on real traffic
-- 🔲 Dashboard refinement
-- 🔲 SLO definition and tracking
-- 🔲 On-call runbook creation
+included in every structured log record throughout the Python process.
+The `traceparent` header carries the trace across service boundaries into the Java layer.
 
 ---
 
@@ -2101,7 +1732,7 @@ flowchart TD
 | `getAssessmentResults` | 5 min | Assessment results don't change mid-session |
 | `getAssessmentByType` | 5 min | Subset of above |
 | `compareToPercentile` | 10 min | Pool percentiles update daily |
-| `getApplicationStatus` | Not cached | Live status — must always be fresh |
+| `getApplicationDetails` | Not cached | Live status — must always be fresh |
 | `getActionableApplications` | Not cached | New applications could arrive |
 | `getCandidateJourney` | Not cached | Stage transitions are live |
 | `getNextSteps` | Not cached | Stage-dependent, must reflect current status |
@@ -2113,56 +1744,13 @@ is a SHA-256 of the serialised tool arguments. TTL resets on every read (sliding
 
 ---
 
-### 11.4 Tool Response Cache — candidate-mcp side
-
-`candidate-mcp` maintains its own Redis cache for calls to downstream services. This
-is **separate from and independent of** the agent-side cache in 12.3. The two caches
-serve different purposes: the candidate-mcp cache reduces downstream load across all
-callers; the agent-side cache reduces MCP round-trips within a session.
-
-```mermaid
-flowchart LR
-    subgraph "careers-ai-service process"
-        PAA_CACHE["agent:tool:* (12.3) Prevents repeat MCP HTTP calls within one session"]
-    end
-    subgraph "candidate-mcp"
-        MCP_CACHE["cmcp:tool:* (12.4) Prevents repeat downstream REST calls across all callers"]
-    end
-    subgraph "Downstream"
-        TPS["talent-profile-service"]
-        CXA["cx-applications"]
-        JSS["job-sync-service"]
-    end
-
-    PAA_CACHE -->|"miss → MCP call"| MCP_CACHE
-    MCP_CACHE -->|"miss → REST"| TPS & CXA & JSS
-```
-
-| Tool | candidate-mcp cache TTL | Invalidation |
-|---|---|---|
-| `getTalentProfile` | 5 min | Profile update event (event-driven invalidation) |
-| `getAssessmentResults` | 5 min | Assessment completion event |
-| `getAssessmentByType` | 5 min | TTL only |
-| `compareToPercentile` | 10 min | TTL only (pool updates daily) |
-| `getSkillsGap` | 5 min | Profile update event |
-| `getJobDetails` | 15 min | Job update event |
-| `getApplicationStatus` | Not cached | Live status |
-| `getActionableApplications` | Not cached | New applications may arrive |
-| `getCandidateJourney` | Not cached | Stage transitions are live |
-| `getNextSteps` | Not cached | Stage-dependent |
-| `getStageDuration` | Not cached | Updates daily |
-| `getInterviewFeedback` | Not cached | Updated post-interview |
-
----
-
-### 11.5 Cache Hierarchy Summary
+### 11.4 Cache Hierarchy Summary
 
 | Cache | Owner | Redis namespace | What it prevents |
 |---|---|---|---|
 | Static schema cache | careers-ai-service | `mcp:schema:*` | 8N redundant schema fetches at startup |
 | Thread state (checkpointer) | careers-ai-service | `langgraph:v2:checkpoint:*` | Lost conversation context across workers and pods |
 | Session tool cache | careers-ai-service | `agent:tool:*` | Repeat MCP HTTP calls within one conversation turn sequence |
-| Tool response cache | candidate-mcp | `cmcp:tool:*` | Repeat downstream REST calls across all callers |
 
 ---
 
@@ -2222,11 +1810,11 @@ so the LLM can interpret it and generate a helpful user-facing message.
 # Request timeout (504 Gateway Timeout)
 {
     "error": "request_timeout",
-    "message": "Agent execution timeout after 60 seconds. Please try a simpler query or contact support.",
+    "message": "Agent execution timeout after 30 seconds. Please try a simpler query or contact support.",
     "retriable": false,
     "details": {
-        "timeout_seconds": 60,
-        "elapsed_seconds": 60.2
+        "timeout_seconds": 30,
+        "elapsed_seconds": 30.2
     }
 }
 ```
@@ -2293,7 +1881,7 @@ Scenarios covered:
 |---|---|---|---|
 | 1 | Profile | C002 | Profile — no ats_requisition_id → `getTalentProfile` |
 | 2 | Profile | C001 / J002 | Skills gap vs unapplied role → `getSkillsGap` |
-| 3 | Application Status | C001 / A001 | FINAL_INTERVIEW status → `getApplicationStatus` |
+| 3 | Application Status | C001 / A001 | FINAL_INTERVIEW status → `getApplicationDetails` |
 | 4 | Application Status | C004 / A004 | OFFER_EXTENDED — offer surfaced |
 | 5 | Application Status | C001 / A006 | REJECTED — constructive tone |
 | 6 | All Applications | C001 | Full history without ats_requisition_id → `getActionableApplications` |
@@ -2344,7 +1932,7 @@ def test_invalid_job_id_format_rejected(client: TestClient):
     assert result is not None
 
 def test_request_timeout_enforced(client: TestClient):
-    """Test that requests timeout after 60 seconds"""
+    """Test that requests timeout after 30 seconds"""
     import time
     start = time.time()
 
@@ -2356,8 +1944,8 @@ def test_request_timeout_enforced(client: TestClient):
 
     elapsed = time.time() - start
 
-    # Should timeout within 65 seconds (60s limit + 5s grace)
-    assert elapsed < 65
+    # Should timeout within 35 seconds (30s limit + 5s grace)
+    assert elapsed < 35
     assert response.status_code in [200, 504]
 
 def test_tool_call_limit_enforced(client: TestClient):
@@ -2392,7 +1980,7 @@ def test_id_validation_error_message_helpful(client: TestClient):
 | Guardrail | Test Scenarios | Acceptance Criteria |
 |---|---|---|
 | **Recursion limit** | Infinite loop query, nested tool calls | ✅ Stops at 25 iterations, returns 504 or helpful message |
-| **Request timeout** | Long-running query, slow downstream | ✅ Stops at 60 seconds, returns 504 with user-friendly message |
+| **Request timeout** | Long-running query, slow downstream | ✅ Stops at 30 seconds, returns 504 with user-friendly message |
 | **Tool call limit** | Overly broad query | ✅ Stops at 10 tool calls, agent asks user to rephrase |
 | **ID validation** | Hallucinated IDs (JSeniorSRE, job-001, A1) | ✅ Rejects with 400, error message teaches correct format |
 | **Convergence patterns** | Sequential tool calls | ✅ Agent stops after sufficient data collected |
