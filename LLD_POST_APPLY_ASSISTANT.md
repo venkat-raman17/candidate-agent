@@ -878,7 +878,7 @@ flowchart LR
         REG -->|"build prompts"| LLM
     end
 
-    CMCP -->|"ats://schema/* ats://workflow/application-stages"| REG
+    CMCP -->|"cx://schema/* cx://workflow/application-stages"| REG
 ```
 
 #### 5.7.3 Benefits
@@ -900,10 +900,10 @@ stripped (PII, internal metadata, database artefacts) are not present.
 
 | MCP Resource URI | Projected Source | Content (agent-safe fields only) |
 |---|---|---|
-| `ats://schema/profile` | `TalentProfileV2` | Assessment results, experience summary, questionnaire responses — no raw contact details |
-| `ats://schema/application` | `AtsApplication` | Stage, status enum, history, metadata — no internal fields |
-| `ats://schema/job` | `JobRequisition` | Title, status, location, job type, shift details — no internal fields |
-| `ats://schema/application-stages` | `ApplicationStage` | Enum of all possible application stages with descriptions — no internal fields |
+| `cx://schema/profile` | `TalentProfileV2` | Assessment results, experience summary, questionnaire responses — no raw contact details |
+| `cx://schema/application` | `AtsApplication` | Stage, status enum, history, metadata — no internal fields |
+| `cx://schema/job` | `JobRequisition` | Title, status, location, job type, shift details — no internal fields |
+| `cx://schema/application-stages` | `ApplicationStage` | Enum of all possible application stages with descriptions — no internal fields |
 
 ---
 
@@ -1068,7 +1068,60 @@ sequenceDiagram
 
 ## 7. Integration Design
 
-### 7.1 MCP Protocol and TLS Handshake Optimisation
+### 7.1 MCP Integration Steps — careers-ai-service to candidate-mcp
+
+This section defines the **onboarding flow** to connect `careers-ai-service`
+to `candidate-mcp`, based on the working implementation from the prototype implementation.
+
+#### 7.1.1 Initialize MCP registry during FastAPI lifespan startup
+
+Load tools/resources once during startup, then attach them to app state so routes and
+dependencies reuse the same registry.
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    registry = await init_registry(settings)
+    graph = build_graph(registry, settings)
+    v2_graph = build_v2_graph(registry, settings)
+
+    app.state.mcp_registry = registry
+    app.state.graph = graph
+    app.state.v2_graph = v2_graph
+    app.state.settings = settings
+    yield
+```
+
+#### 7.1.2 Load candidate-mcp tools and static schema resources
+
+At startup, create the MCP client (`streamable_http`), then fetch:
+
+- dynamic callable tools (for runtime tool invocation)
+- static resources (for system-prompt schema grounding)
+
+```python
+client = MultiServerMCPClient(
+    {
+        "candidate_mcp": {
+            "url": settings.mcp_server_url,
+            "transport": "streamable_http",
+            "headers": {"Accept": "application/json, text/event-stream"},
+        }
+    }
+)
+
+all_tools = await client.get_tools()
+post_apply_tools = [t for t in all_tools if t.name in POST_APPLY_TOOL_NAMES]
+blobs = await client.get_resources("candidate_mcp", uris=_KNOWLEDGE_URIS)
+```
+
+Resource URIs loaded in the reference implementation:
+
+- `cx://workflow/application-states`
+- `cx://schema/candidate`
+- `cx://schema/application`
+
+### 7.2 MCP Protocol and TLS Handshake Optimisation
 
 `candidate-mcp` uses **stateless streamable HTTP**. This means `langchain-mcp-adapters`
 creates a new HTTP session (including a full TLS handshake) for every individual tool
@@ -1179,7 +1232,7 @@ Any pod handles any call — no sticky sessions required. Connection pool distri
 across all healthy pods; a new handshake occurs only when a connection to a previously
 unseen pod is first established.
 
-### 7.2 Downstream Service Contracts
+### 7.3 Downstream Service Contracts
 
 `candidate-mcp` consumes three downstream services in production:
 
@@ -1568,33 +1621,28 @@ The `traceparent` header carries the trace across service boundaries into the Ja
 
 The production `careers-ai-service` service already operates a Redis cluster shared
 across all worker processes and pods. The v2 primary assistant flow uses this same
-Redis instance for four distinct caching concerns, each with its own key namespace
-and TTL policy.
+Redis instance for distributed state management of the LangGraph conversation checkpointer.
 
 ```mermaid
 flowchart LR
-    subgraph "careers-ai-service process (8 workers × N pods)"
-        W1["Worker 1"]
-        W2["Worker 2"]
-        WN["Worker N"]
+    subgraph "careers-ai-service instances"
+        W1["Worker 1 (MCP resource cache)"]
+        W2["Worker 2 (MCP resource cache)"]
+        WN["Worker N (MCP resource cache)"]
     end
 
     subgraph "Shared Redis Cluster"
-        NS1["mcp:schema:* Static resource schemas"]
         NS2["langgraph:checkpoint:* Thread conversation state"]
-        NS3["agent:tool:* Within-session tool cache"]
     end
 
     subgraph "candidate-mcp"
-        NS4["cmcp:tool:* Tool response cache"]
         SR["Static Resources (source of truth)"]
     end
 
-    W1 & W2 & WN <-->|"read / write"| NS1
     W1 & W2 & WN <-->|"read / write"| NS2
-    W1 & W2 & WN <-->|"read / write"| NS3
-    W1 & W2 & WN -->|"MCP tool call (if agent:tool miss)"| NS4
-    SR -.->|"fetched once then cached in mcp:schema"| W1
+    SR -.->|"fetched once then cached in worker memory"| W1
+    SR -.->|"fetched once then cached in worker memory"| W2
+    SR -.->|"fetched once then cached in worker memory"| WN
 ```
 
 ---
@@ -1602,72 +1650,61 @@ flowchart LR
 ### 11.1 MCP Static Resource Schema Cache — careers-ai-service side
 
 **Problem:** `candidate-mcp` exposes 4–5 static JSON Schema resources
-(`ats://schema/*`). The Python agent fetches these during `init_registry()` at
+(`cx://schema/*`). The Python agent fetches these during `init_registry()` at
 startup and embeds them in the LLM system prompt. With **8 Uvicorn worker
 processes per pod** and multiple pods, each worker starts independently and calls
-`init_registry()` — resulting in up to `8 × N_pods` redundant fetches of the same
-immutable schemas on every deployment.
+`init_registry()`.
 
-**Solution — distributed lock + Redis schema cache:**
+**Solution — per-worker in-memory schema cache:**
+
+Each worker fetches MCP static resources once during startup and stores them in
+process memory for the lifetime of that worker. Subsequent requests served by the
+same worker reuse the in-memory schemas to build prompt context.
 
 ```mermaid
 sequenceDiagram
-    participant W1 as Worker 1 (first to start)
-    participant W2 as Worker 2 (concurrent start)
-    participant Redis as Redis
+    participant W1 as Worker 1
+    participant W2 as Worker 2
     participant CMCP as candidate-mcp
 
     par Worker 1 startup
-        W1->>Redis: GET mcp:schema:ats://schema/candidate
-        Redis-->>W1: (nil — cache miss)
-        W1->>Redis: SET mcp:lock:schema_init EX 30 NX
-        Redis-->>W1: OK (lock acquired)
         W1->>CMCP: fetch all static resources
-        CMCP-->>W1: schema blobs (4 keys)
-        W1->>Redis: SET mcp:schema:* EX 86400 (24h)
-        W1->>Redis: DEL mcp:lock:schema_init
+        CMCP-->>W1: schema blobs
+        W1->>W1: cache schemas in memory
     and Worker 2 startup (concurrent)
-        W2->>Redis: GET mcp:schema:ats://schema/candidate
-        Redis-->>W2: (nil — not yet populated)
-        W2->>Redis: SET mcp:lock:schema_init EX 30 NX
-        Redis-->>W2: (nil — lock held by W1)
-        note over W2: poll Redis every 500ms (max 15s)
-        W2->>Redis: GET mcp:schema:ats://schema/candidate
-        Redis-->>W2: schema blob (populated by W1)
-        note over W2: all schemas present — skip fetch
+        W2->>CMCP: fetch all static resources
+        CMCP-->>W2: schema blobs
+        W2->>W2: cache schemas in memory
     end
 
-    note over W1,W2: both workers build system prompt<br/>from cached schemas — zero extra MCP calls
+    note over W1,W2: each worker fetches once at startup,<br/>then reuses schemas for all requests
 ```
 
 **Key design rules:**
 
 | Rule | Detail |
 |---|---|
-| Lock TTL | 30 seconds — prevents deadlock if the locking worker crashes mid-fetch |
-| Schema cache TTL | 24 hours — schemas change only on `candidate-mcp` redeploy |
-| Invalidation on redeploy | `candidate-mcp` writes a new `mcp:schema:version` key on startup. Workers detect the version change on their next startup and force a cache refresh. |
-| Fallback | If Redis is unavailable at startup, each worker falls back to fetching directly from `candidate-mcp` (degraded but functional) |
-| Key namespace | `mcp:schema:{uri}` — e.g. `mcp:schema:ats://schema/candidate` |
+| Cache scope | Process-local memory (per worker) |
+| Cache lifetime | Worker lifetime (refreshes on worker restart/redeploy) |
+| Invalidation | Implicit via worker restart / deployment rollout |
 
-**Result:** regardless of how many workers or pods start simultaneously, `candidate-mcp`
-receives at most **one schema fetch per deployment** rather than one per worker.
+**Result:** each worker performs one startup schema fetch, then serves requests using
+its in-memory copy with no repeated schema fetch during normal request handling.
 
 ---
 
 ### 11.2 LangGraph Thread State — Conversation Checkpointer
 
-**Problem:** The current v1 and v2 graphs use `MemorySaver` — an in-process
-Python dictionary. With 8 workers per pod and multiple pods, any turn of a
-multi-turn conversation may be served by a **different worker or pod** than the
-previous turn. `MemorySaver` is invisible across process boundaries. The
-conversation history is lost on every cross-worker or cross-pod request.
+**Current State:** v1 already uses a Redis-backed LangGraph
+checkpointer. The same shared Redis infrastructure and existing checkpointer
+tables are reused for v2.
 
-**Solution — Redis-backed LangGraph checkpointer:**
+**Solution — Reuse existing production checkpointer for v2:**
 
-Replace `MemorySaver` with an `AsyncRedisSaver` that stores the full LangGraph
-checkpoint (conversation message history + agent state) in Redis, keyed by
-`thread_id`. All workers and all pods read and write the same checkpoint store.
+v2 uses the same Redis deployment used by v1 and stores the full
+LangGraph checkpoint (conversation message history + agent state) keyed by
+`thread_id`. All workers and all pods read and write the same shared checkpoint
+store.
 
 ```mermaid
 sequenceDiagram
@@ -1690,68 +1727,20 @@ sequenceDiagram
 
 | Parameter | Value | Reason |
 |---|---|---|
-| Key namespace | `langgraph:v2:checkpoint:{thread_id}` | Separate from v1 (`langgraph:v1:*`) — no cross-version state pollution |
+| Infrastructure | Existing production Redis + existing checkpointer tables | No new infrastructure required for v2 |
+| Key namespace | `langgraph:v2:checkpoint:{thread_id}` | Separate from v1 while reusing the same underlying store/tables |
 | TTL | 2 hours from last write | Matches expected candidate session length; prevents stale checkpoints accumulating |
 | Serialisation | JSON (LangGraph native) | Human-readable, inspectable in Redis CLI for debugging |
-| v1 graph checkpointer | Also migrated to Redis (same cluster, `langgraph:v1:*` namespace) | Consistent across both graphs; eliminates same problem in v1 |
+| v1 graph checkpointer | Already in production on the same infra/tables | v2 rollout reuses proven production path |
 
 ---
 
-### 11.3 Within-Session Tool Response Cache — careers-ai-service side
+### 11.3 Cache Hierarchy Summary
 
-**Problem:** Within a single multi-turn conversation, the candidate may ask several
-related questions. Each question may trigger the same MCP tool call with the same
-arguments (e.g. `getTalentProfile` called on turn 1, turn 3, and turn 5 of the
-same session). Each call incurs an MCP HTTP round-trip.
-
-**Solution — short-TTL per-session tool response cache:**
-
-After a tool call completes, store the result in Redis keyed by
-`{tool_name}:{talent_profile_id}:{args_hash}` with a short TTL. Subsequent tool calls
-with the same arguments within the TTL window return the cached result without
-hitting `candidate-mcp`.
-
-```mermaid
-flowchart TD
-    PAA["post_apply_assistant tool call: getTalentProfile(C001)"]
-    AC{{"Redis agent:tool:getTalentProfile:C001 (session-scoped · short TTL)"}}
-    CMCP["candidate-mcp (HTTP + TLS + downstream call)"]
-
-    PAA -->|"lookup"| AC
-    AC -->|"HIT (< 5 min old)"| PAA
-    AC -->|"MISS"| CMCP
-    CMCP -->|"result"| AC
-    AC --> PAA
-```
-
-| Tool | Agent-side cache TTL | Notes |
-|---|---|---|
-| `getTalentProfile` | 5 min | Profile stable within a session |
-| `getSkillsGap` | 5 min | Keyed by talentProfileId + jobId |
-| `getJobDetails` | 10 min | Job data changes rarely; same job enriched across multiple applications |
-| `getAssessmentResults` | 5 min | Assessment results don't change mid-session |
-| `getAssessmentByType` | 5 min | Subset of above |
-| `compareToPercentile` | 10 min | Pool percentiles update daily |
-| `getApplicationDetails` | Not cached | Live status — must always be fresh |
-| `getActionableApplications` | Not cached | New applications could arrive |
-| `getCandidateJourney` | Not cached | Stage transitions are live |
-| `getNextSteps` | Not cached | Stage-dependent, must reflect current status |
-| `getStageDuration` | Not cached | Increments daily |
-| `getInterviewFeedback` | Not cached | Updated post-interview |
-
-Key namespace: `agent:tool:{tool_name}:{talent_profile_id}:{args_hash}` where `args_hash`
-is a SHA-256 of the serialised tool arguments. TTL resets on every read (sliding).
-
----
-
-### 11.4 Cache Hierarchy Summary
-
-| Cache | Owner | Redis namespace | What it prevents |
-|---|---|---|---|
-| Static schema cache | careers-ai-service | `mcp:schema:*` | 8N redundant schema fetches at startup |
-| Thread state (checkpointer) | careers-ai-service | `langgraph:v2:checkpoint:*` | Lost conversation context across workers and pods |
-| Session tool cache | careers-ai-service | `agent:tool:*` | Repeat MCP HTTP calls within one conversation turn sequence |
-
+| Cache | Owner | Storage | Namespace / Scope | What it prevents |
+|---|---|---|---|---|
+| Static schema cache | careers-ai-service | Worker memory | Process-local (per worker) | Repeat schema fetches during request handling on the same worker |
+| Thread state (checkpointer) | careers-ai-service | Redis | `langgraph:v2:checkpoint:*` | Lost conversation context across workers and pods |
 ---
 
 ## 12. Error Handling
@@ -1771,30 +1760,17 @@ so the LLM can interpret it and generate a helpful user-facing message.
 
 | Scenario | Error Code | HTTP Status | Retriable | Example Response |
 |---|---|---|---|---|
-| Resource not found (404) | `{resource}_not_found` | 404 | No | `{"error": "job_not_found", "message": "Job J001 not found"}` |
-| Access denied (403) | `access_denied` | 403 | No | `{"error": "access_denied", "message": "Access denied"}` |
+| Resource not found (404) | `{resource}_not_found` | 404 | No | `{"error": "job_not_found", "message": "Job R-12345 not found"}` |
+| Access denied (403) | `access_denied` | 403 | No | `{"error": "access_denied", "message": "Unauthorized access"}` |
 | Service timeout | `service_timeout` | 504 | Yes | `{"error": "service_timeout", "message": "Request timed out"}` |
 | Circuit breaker open | `service_unavailable` | 503 | Yes | `{"error": "service_unavailable", "message": "Service temporarily unavailable"}` |
 | Unexpected error | `internal_error` | 500 | No | `{"error": "internal_error", "message": "An unexpected error occurred"}` |
-| **Invalid ID format** (NEW) | `invalid_id_format` | 400 | No | `{"error": "invalid_id_format", "message": "Invalid job_id format: 'JSeniorSRE'. Expected format: J### (e.g., J001). Use exact IDs from getActionableApplications()."}` |
-| **Recursion limit exceeded** (NEW) | `recursion_limit_exceeded` | 504 | No | `{"error": "recursion_limit_exceeded", "message": "Request exceeded maximum iteration limit (25). Please simplify your query."}` |
-| **Request timeout** (NEW) | `request_timeout` | 504 | No | `{"error": "request_timeout", "message": "Agent execution timeout. Please try a simpler query or contact support."}` |
+| **Recursion limit exceeded** | `recursion_limit_exceeded` | 504 | No | `{"error": "recursion_limit_exceeded", "message": "Request exceeded maximum iteration limit (25). Please simplify your query."}` |
+| **Request timeout** | `request_timeout` | 504 | No | `{"error": "request_timeout", "message": "Agent execution timeout. Please try a simpler query or contact support."}` |
 
 **Guardrail Error Response Examples**:
 
 ```python
-# Invalid ID format error (400 Bad Request)
-{
-    "error": "invalid_id_format",
-    "message": "Invalid job_id format: 'JSeniorSRE'. Expected format: J### (e.g., J001, J002). Do not guess job IDs. Use exact IDs from getActionableApplications() results.",
-    "retriable": false,
-    "details": {
-        "provided_id": "JSeniorSRE",
-        "expected_pattern": "^J\\d{3}$",
-        "valid_examples": ["J001", "J002", "J003"]
-    }
-}
-
 # Recursion limit exceeded (504 Gateway Timeout)
 {
     "error": "recursion_limit_exceeded",
@@ -1806,7 +1782,6 @@ so the LLM can interpret it and generate a helpful user-facing message.
         "tool_calls": 12
     }
 }
-
 # Request timeout (504 Gateway Timeout)
 {
     "error": "request_timeout",
@@ -1819,7 +1794,7 @@ so the LLM can interpret it and generate a helpful user-facing message.
 }
 ```
 
-Stack traces, internal URLs, and raw downstream response bodies are never included
+Stack traces, internal metadata, and raw downstream response bodies are never included
 in the error envelope.
 
 ---
@@ -1830,16 +1805,14 @@ in the error envelope.
 
 ```mermaid
 flowchart TB
-    E2E["End-to-End Tests ────────────────────── Python pytest · live stack Full conversation scenarios"]
-    INT_PY["Python Integration Tests ────────────────────── ASGI client + real candidate-mcp Lifespan-managed fixture"]
-    INT_JAVA["Java Integration Tests ────────────────────── Spring Boot Test + WireMock Downstream services stubbed"]
-    CONTRACT["Contract Tests  Pact ────────────────────── candidate-mcp as consumer cx-apps and talent-profile as providers Published to Pact Broker"]
+    E2E["End-to-End Tests ────────────────────── Python pytest · Full conversation scenarios"]
+    INT_PY["Python Integration Tests ────────────────────── ASGI client + candidate-mcp Lifespan-managed fixture"]
+    INT_JAVA["Java Integration Tests ────────────────────── JUnit5 + Downstream services stubbed"]
     UNIT["Unit Tests ────────────────────── Tool handlers: JSON shape Error paths: 4xx · 5xx · circuit open Token provider: refresh boundary"]
 
     E2E --> INT_PY
     INT_PY --> INT_JAVA
-    INT_JAVA --> CONTRACT
-    CONTRACT --> UNIT
+    INT_JAVA --> UNIT
 ```
 
 ### 13.2 Key Scenarios by Layer
@@ -1850,146 +1823,39 @@ flowchart TB
 - Circuit open: graceful degraded envelope returned without touching the downstream client.
 - Retry: client retries on 503, succeeds on the third attempt.
 
-**Integration (Java — Spring Boot + WireMock)**
+**Integration (Java — JUnit5)**
 - Full tool call through WebClient to a WireMocked downstream service.
 - Circuit breaker trips after 20 consecutive failures.
 - App2App signature headers are computed and injected into the downstream request header.
 - Schema resources are served at startup and contain the expected JSON Schema fields.
-
-**Contract (Pact)**
-- `candidate-mcp` publishes consumer contracts for each endpoint it calls on `talent-profile-service` and `cx-applications`.
-- Downstream teams run provider verification in their own CI pipeline.
-- Breaking API changes are caught before any deployment, not at runtime.
 
 **Integration (Python — pytest)**
 - Handoff from primary to `post_apply_assistant` fires for recognised intent patterns.
 - `post_apply_assistant` reaches END with a non-empty response.
 - Schema resources are loaded and embedded in the system prompt during lifespan startup.
 
-**v2 Scenario Test Runner (`tests/test_v2_scenarios.py`)**
+**Guardrail-Specific Tests**
 
-A standalone script that exercises 14 end-to-end scenarios against a live stack and
-reports per-scenario pass/fail with tool call names, agent used, response preview,
-and total run time. Soft assertions check:
-- `agent_used` equals `"post_apply_assistant"` for all domain queries
-- Expected tools appear in `tool_calls`
-- Key domain keywords appear in the response text
-
-Scenarios covered:
-
-| # | Group | Candidate / Application | Scenario |
-|---|---|---|---|
-| 1 | Profile | C002 | Profile — no ats_requisition_id → `getTalentProfile` |
-| 2 | Profile | C001 / J002 | Skills gap vs unapplied role → `getSkillsGap` |
-| 3 | Application Status | C001 / A001 | FINAL_INTERVIEW status → `getApplicationDetails` |
-| 4 | Application Status | C004 / A004 | OFFER_EXTENDED — offer surfaced |
-| 5 | Application Status | C001 / A006 | REJECTED — constructive tone |
-| 6 | All Applications | C001 | Full history without ats_requisition_id → `getActionableApplications` |
-| 7 | All Applications | C006 | Journey narrative without ats_requisition_id |
-| 8 | Assessments | C004 / A004 | All 3 assessments (97–98th percentile) → `getAssessmentResults` |
-| 9 | Assessments | C002 / A002 | Percentile comparison (94th) → `compareToPercentile` |
-| 10 | Next Steps | C002 / A002 | PHONE_INTERVIEW prep → `getNextSteps` |
-| 11 | Next Steps | C006 / A007 | Stage duration / SLA check → `getStageDuration` |
-| 12 | Streaming | C003 / A003 | SSE stream — status + next steps (SCREENING stage) |
-| 13 | Edge Cases | C005 / A005 | HIRED candidate — journey summary → `getCandidateJourney` |
-| 14 | Edge Cases | C001 / A001 | Interview feedback (3 rounds + recruiter notes) → `getInterviewFeedback` |
-
-**Guardrail-Specific Tests** (NEW):
-
-```python
-# File: careers-ai-service/tests/test_guardrails.py
-import pytest
-from fastapi.testclient import TestClient
-
-def test_recursion_limit_prevents_infinite_loop(client: TestClient):
-    """Test that recursion limit stops infinite loops"""
-    response = client.post("/api/v2/agent/invoke", json={
-        "thread_id": "test-recursion",
-        "talent_profile_id": "C001",
-        "message": "Tell me everything about everything repeatedly"  # Intentionally vague
-    })
-
-    # Should complete within reasonable time
-    assert response.status_code in [200, 504]  # Success or timeout
-
-    # If successful, check iteration count
-    if response.status_code == 200:
-        data = response.json()
-        # Should not exceed recursion limit
-        assert data.get("iterations", 0) <= 25
-
-def test_invalid_job_id_format_rejected(client: TestClient):
-    """Test that hallucinated job IDs are rejected"""
-    # Simulate agent trying to call getJobDetails with invalid ID
-    with pytest.raises(ValueError, match="Invalid job_id format"):
-        job_tools.getJobDetails("JSeniorSRE")  # Should fail validation
-
-    with pytest.raises(ValueError, match="Invalid job_id format"):
-        job_tools.getJobDetails("job-001")  # Should fail validation
-
-    # Valid ID should pass
-    result = job_tools.getJobDetails("J001")
-    assert result is not None
-
-def test_request_timeout_enforced(client: TestClient):
-    """Test that requests timeout after 30 seconds"""
-    import time
-    start = time.time()
-
-    response = client.post("/api/v2/agent/invoke", json={
-        "thread_id": "test-timeout",
-        "talent_profile_id": "C001",
-        "message": "Some query that might loop"
-    })
-
-    elapsed = time.time() - start
-
-    # Should timeout within 35 seconds (30s limit + 5s grace)
-    assert elapsed < 35
-    assert response.status_code in [200, 504]
-
-def test_tool_call_limit_enforced(client: TestClient):
-    """Test that tool call limit prevents excessive calls"""
-    response = client.post("/api/v2/agent/invoke", json={
-        "thread_id": "test-tool-limit",
-        "talent_profile_id": "C001",
-        "message": "Show me detailed information about every single field"
-    })
-
-    assert response.status_code == 200
-    data = response.json()
-    # Should not exceed tool call limit
-    assert data.get("tool_calls_made", 0) <= 10
-
-def test_id_validation_error_message_helpful(client: TestClient):
-    """Test that ID validation errors provide helpful guidance"""
-    try:
-        job_tools.getJobDetails("JSeniorSRE")
-        pytest.fail("Should have raised error")
-    except ValueError as e:
-        error_msg = str(e)
-        # Error message should include:
-        assert "Invalid job_id format" in error_msg
-        assert "J###" in error_msg  # Expected format
-        assert "J001" in error_msg  # Valid example
-        assert "getActionableApplications" in error_msg  # Correct approach
-```
+- `test_recursion_limit_prevents_infinite_loop`: verifies requests stop at recursion limit (25) and return success/timeout safely.
+- `test_invalid_job_id_format_rejected`: verifies invalid/hallucinated job IDs are rejected and valid IDs pass.
+- `test_request_timeout_enforced`: verifies request-level timeout is enforced at 30 seconds (with grace window).
+- `test_tool_call_limit_enforced`: verifies per-request tool call limit is enforced at 10 calls.
+- `test_id_validation_error_message_helpful`: verifies ID validation errors contain actionable guidance and valid format examples.
 
 **Test Coverage Requirements**:
 
 | Guardrail | Test Scenarios | Acceptance Criteria |
 |---|---|---|
-| **Recursion limit** | Infinite loop query, nested tool calls | ✅ Stops at 25 iterations, returns 504 or helpful message |
-| **Request timeout** | Long-running query, slow downstream | ✅ Stops at 30 seconds, returns 504 with user-friendly message |
-| **Tool call limit** | Overly broad query | ✅ Stops at 10 tool calls, agent asks user to rephrase |
-| **ID validation** | Hallucinated IDs (JSeniorSRE, job-001, A1) | ✅ Rejects with 400, error message teaches correct format |
-| **Convergence patterns** | Sequential tool calls | ✅ Agent stops after sufficient data collected |
+| **Recursion limit** | Infinite loop query, nested tool calls | Stops at 25 iterations, returns 504 or helpful message |
+| **Request timeout** | Long-running query, slow downstream | Stops at 30 seconds, returns 504 with user-friendly message |
+| **Tool call limit** | Overly broad query | Stops at 10 tool calls, agent asks user to rephrase |
+| **ID validation** | Hallucinated IDs (JSeniorSRE, job-001, A1) | Rejects with 400, error message teaches correct format |
+| **Convergence patterns** | Sequential tool calls | Agent stops after sufficient data collected |
 
 **End-to-End**
 - Candidate asks for application status → `agent_used: post_apply_assistant`, response references atsRequisitionId.
 - Candidate asks for skills gap against a role → `getTalentProfile` and `getSkillsGap` both called.
 - `cx-applications` unavailable → user receives a degraded but helpful response.
-- Existing job search query → still routed to existing job search assistant, untouched.
 
 ---
 
@@ -2001,30 +1867,32 @@ def test_id_validation_error_message_helpful(client: TestClient):
 flowchart TD
     subgraph "Kubernetes Cluster"
         subgraph "Agent Namespace"
-            AGT["careers-agent Python · Uvicorn replicas: 2"]
+            AGT["careers-agent Python replicas: 36"]
         end
 
         subgraph "MCP Namespace"
-            CMCP["candidate-mcp Java · Spring AI replicas: 2"]
+            CMCP["candidate-mcp Java replicas: 9"]
         end
 
         subgraph "Infrastructure"
             REDIS[("Redis")]
         end
 
-        INGRESS["Ingress / API Gateway"]
+        INGRESS["Ingress Controller"]
     end
 
     subgraph "Downstream"
         CXA["cx-applications"]
         TPS["talent-profile-service"]
+        JSS["job-sync-service"]
     end
 
     INGRESS --> AGT
     AGT -->|"MCP"| CMCP
-    CMCP --> REDIS
-    CMCP --> CXA
-    CMCP --> TPS
+    AGT --> REDIS
+    CMCP -->|"REST"| CXA
+    CMCP -->|"REST"| TPS
+    CMCP -->|"REST"| JSS
 
 ```
 
@@ -2043,10 +1911,9 @@ recovers.
 
 | Config Type | Mechanism |
 |---|---|
-| Service URLs | Kubernetes `ConfigMap` → environment variables |
-| App2App shared secrets | Kubernetes `Secret` → environment variables (one per service pair) |
-| Redis connection | Kubernetes `Secret` → Spring config |
-| candidate-mcp URL (Python) | Kubernetes `ConfigMap` → `.env` |
+| Service URLs | CCM `ConfigMap` → environment variables |
+| App2App private key | Akeyless Vault `PrivateKey` → environment variables |
+| candidate-mcp URL (Python) | CCM `ConfigMap` → `.env` |
 
 ---
 
@@ -2088,11 +1955,8 @@ introduced in the same `careers-ai-service` process. The existing v1 graph and
 - Inject `post_apply_assistant` into the existing v1 graph → rejected: risks
   destabilising the live job search assistant; changes the routing logic of a
   production graph that is currently working.
-- Deploy a separate microservice for post-apply → rejected: disproportionate
-  operational overhead for a new sub-assistant.
 
-**Consequence:** v1 and v2 graphs coexist in the same process, sharing only the
-MCP tool registry and settings. v2 can be iterated independently. Future
+**Consequence:** v1 and v2 graphs coexist in the same process. With MCP registry attached to v2, v2 can be iterated independently. Future
 consolidation replaces v1 with v2 once all sub-assistants are stable.
 
 ---
@@ -2104,33 +1968,14 @@ signature — both `careers-ai-service` → `candidate-mcp` and `candidate-mcp` 
 downstream services. No OAuth2 server is involved at any hop.
 
 **Alternatives considered:**
-- Mutual TLS (mTLS) → certificate lifecycle complexity for internal service hops.
-- OAuth2 client credentials (JWT bearer) → requires an OAuth2 server; adds a
-  network dependency on the hot path for every service call.
-- No authentication → rejected immediately; all endpoints expose live candidate data.
+- IAM token → rejected: adds an external dependency, more complex token management, less transparent security model.
 
 **Consequence:** Authentication is entirely self-contained. No external auth server
-dependency at any hop. All secrets managed via K8s Secrets / Vault. Rotation
-requires coordinated redeployment of the affected service pair (or live Vault reload).
+dependency at any hop. All secrets managed via Akeyless Vault.
 
 ---
 
-### DD-04: Reuse candidate-mcp Rather Than Creating a New MCP Server
-
-**Decision:** `post_apply_assistant` connects to the existing `candidate-mcp` server,
-which is evolved to call real downstream services. A new separate MCP server is not
-created.
-
-**Alternatives considered:**
-- New dedicated MCP server for post-apply domain → rejected: duplicates the MCP
-  infrastructure, splits the schema resource mechanism, increases operational overhead.
-
-**Consequence:** All candidate domain tooling lives in one MCP server. Any extension
-to the candidate domain (new tools, new schema resources) happens in one place.
-
----
-
-### DD-05: MCP Static Resources as Schema Carrier for careers-data-schema
+### DD-04: MCP Static Resources as Schema Carrier for careers-data-schema
 
 **Decision:** `candidate-mcp` takes `careers-data-schema` as a compile-time dependency,
 serialises the Java models to JSON Schema, and exposes them as MCP static resources.
@@ -2146,7 +1991,7 @@ redeploying `candidate-mcp`. This is an intentional and auditable deployment gat
 
 ---
 
-### DD-06: Stateless MCP over Stateful Sessions
+### DD-05: Stateless MCP over Stateful Sessions
 
 **Decision:** `candidate-mcp` uses `STATELESS` protocol mode. Each tool call is an
 independent HTTP request.
@@ -2160,7 +2005,7 @@ session-init overhead but latency is dominated by the downstream service call it
 
 ---
 
-### DD-07: Shared httpx Connection Pool with HTTP/2 to Eliminate Per-Tool TLS Overhead
+### DD-06: Shared httpx Connection Pool with HTTP/2 to Eliminate Per-Tool TLS Overhead
 
 **Decision:** A single `httpx.AsyncClient` instance with `http2=True` and a
 configured keep-alive pool is shared across all MCP tool calls within a process
@@ -2177,72 +2022,39 @@ of avoidable overhead on top of actual tool execution.
   overhead is a 20% regression for no benefit.
 - HTTP/1.1 keep-alive only (no HTTP/2) → acceptable fallback, but HTTP/2 multiplexing
   allows concurrent tool calls to the same pod over a single connection — strictly
-  better if `candidate-mcp` supports it (Tomcat does by default with `h2`).
+  better if `candidate-mcp` supports it.
 - Connection per request (current default in langchain-mcp-adapters) → baseline,
   rejected for production.
 
-**Consequence:** The `SignatureProvider` transport patch (R-01) must also configure
+**Consequence:** The `SignatureProvider` transport patch must also configure
 the shared `httpx.AsyncClient`. These two concerns are implemented together in the
 same transport wrapper.
 
 ---
 
-### DD-08: Redis-Backed LangGraph Checkpointer Replaces MemorySaver
+### DD-07: Per-Worker In-Memory Cache for MCP Static Resource Startup
 
-**Decision:** Both the v1 and v2 graphs use `AsyncRedisSaver` as their LangGraph
-checkpointer rather than `MemorySaver`.
+**Decision:** Each Uvicorn worker fetches MCP static schema resources from
+`candidate-mcp` during its own `init_registry()` startup and stores them in
+process-local memory for the worker lifetime. No Redis cache or distributed lock is
+used for schema startup coordination.
 
-**Problem:** With 8 uvicorn workers per pod and multiple pods, `MemorySaver` is
-per-process. Any multi-turn conversation whose second request lands on a different
-worker or pod silently loses all conversation history. The candidate sees the agent
-"forget" everything from the previous turn.
+**Problem:** The agent needs agent context schema-grounded prompts without adding cross-process
+coordination complexity to the startup path.
 
 **Alternatives considered:**
-- Sticky sessions (route by `thread_id`) → requires session affinity in the ingress
-  / load balancer; defeats horizontal scaling; single pod failure loses all
-  in-flight sessions.
-- External session store per worker → still requires cross-process synchronisation;
-  effectively reinvents a distributed cache.
-- Accept conversation loss → rejected immediately; multi-turn context is a core
-  product requirement.
+- Distributed lock + Redis schema cache → rejected: adds coordination logic and
+    operational coupling for data that is immutable for the worker lifetime.
+- On-demand schema fetch during request handling → rejected: adds request-time
+    latency and external dependency on the hot path.
 
-**Consequence:** Adds a Redis write on every checkpoint (every LLM turn). Redis
-is already in production infrastructure. The write cost is a single JSON set
-operation per turn — negligible compared to LLM and downstream service latency.
-Thread TTL of 2 hours prevents unbounded key growth.
+**Consequence:** Startup can generate parallel identical fetches (8 workers × N pods),
+which is accepted as deployment-time overhead. Normal request handling performs no
+schema fetches.
 
 ---
 
-### DD-09: Distributed Lock + Redis Cache for MCP Static Resource Startup
-
-**Decision:** `init_registry()` checks Redis for cached schema blobs before
-fetching from `candidate-mcp`. The first worker to acquire a distributed lock
-performs the fetch and populates the cache; all other workers wait and then read
-from the cache.
-
-**Problem:** 8 workers × N pods each calling `init_registry()` independently would
-send up to 8N identical requests to `candidate-mcp` for immutable schema data on
-every deployment restart. This unnecessarily loads the MCP server and slows startup.
-
-**Alternatives considered:**
-- Pre-startup script (init container) fetches and seeds Redis → rejected: adds a
-  Kubernetes init container dependency; complicates the deployment manifest;
-  schemas still need to be refreshed on `candidate-mcp` redeploy.
-- Single-worker startup model (run `init_registry()` once in the parent process
-  before forking) → not compatible with uvicorn's `--workers` process model where
-  each worker is a forked process that runs its own lifespan.
-- Accept redundant fetches → acceptable in small deployments, but at 8 workers ×
-  5 pods = 40 fetches on a rolling restart this produces a measurable spike.
-
-**Consequence:** Schemas are effectively immutable per `candidate-mcp` deployment.
-A 24-hour TTL with version-key invalidation ensures the agent is never more than
-one restart away from picking up a new schema. The distributed lock introduces a
-short (< 1s typical) startup delay for workers that lose the lock race — acceptable
-given startup only happens on deployment.
-
----
-
-### DD-10: Circuit Breaker per Downstream Service
+### DD-08: Circuit Breaker per Downstream Service
 
 **Decision:** Three independent Resilience4j circuit breakers — one each for
 `talent-profile-service`, `cx-applications`, and `job-sync-service`.
@@ -2262,19 +2074,11 @@ assistant can still answer application status queries without job details.
 
 | ID | Issue / Risk | Severity | Owner | Status |
 |---|---|---|---|---|
-| R-01 | `langchain-mcp-adapters` does not natively support custom per-request header injection. The `SignatureProvider` must wrap or patch the httpx transport layer. Verify compatibility with `langchain-mcp-adapters 0.2.x`. Same httpx transport patch also enables shared connection pool for TLS reuse. | High | Platform team | Open — spike required |
-| R-02 | App2App shared secret rotation requires coordinated redeployment of the affected service pair (or live Vault reload). Applies to all three service hops. Rotation procedure not yet defined. | High | Security / Infra | Open |
-| R-03 | Clock drift between the Python agent host and `candidate-mcp` pods may cause valid signatures to be rejected if drift exceeds TTL. NTP synchronisation must be enforced across all pods. | Medium | Infra team | Open |
-| R-04 | `careers-data-schema` does not currently produce JSON Schema output. Serialisation logic must be added to `candidate-mcp`. | Medium | Backend team | Open |
-| R-05 | Downstream service API contracts with `cx-applications` and `talent-profile-service` are not yet formalised as Pact consumer contracts. Schema drift is undetected until runtime. | Medium | QA / Backend teams | Open — Pact adoption planned for Q3 |
-| R-06 | Redis unavailability at careers-ai-service startup: if Redis is down, the distributed lock cannot be acquired and workers fall back to fetching schemas directly from `candidate-mcp` (8N fetches). Acceptable degraded path but must be tested. | Low | Infra team | Accepted |
-| R-07 | Redis unavailability during request handling: LangGraph checkpointer fails to save/load → conversation context is lost for that turn. Agent should catch the exception and respond without context rather than returning a 500. Circuit breaker around Redis operations recommended. | Medium | Platform team | Open |
-| R-08 | Embedding all schema resources in the LLM system prompt consumes context window tokens. Impact to be measured in staging. | Low | AI team | Open |
-| R-09 | v1 and v2 graphs share no state. A user switching between `/api/v1` and `/api/v2` endpoints within the same session will lose conversation context. Cross-version thread continuity is not supported and must be communicated to consumers. | Low | Platform team | Accepted for now |
+| R-01 | `langchain-mcp-adapters` does not natively support custom per-request header injection. The `SignatureProvider` must wrap or patch the httpx transport layer. Verify compatibility with `langchain-mcp-adapters 0.1.x`. Same httpx transport patch also enables shared connection pool for TLS reuse. | High | Dev team | Open — spike required |
+| R-02 | Deployment-time startup burst: workers fetch static schemas in parallel (8N pattern) during rolling restarts, potentially spiking `candidate-mcp` briefly. This does not affect steady-state request latency but should be load-tested. | Low | Dev team | Accepted |
+| R-03 | Embedding all schema resources in the LLM system prompt consumes context window tokens. Impact to be measured in staging. | Low | Dev team | Open |
+| R-04 | v1 and v2 graphs share no state. A user switching between `/api/v1` and `/api/v2` endpoints within the same session will lose conversation context. Cross-version thread continuity is not supported and must be communicated to consumers. | Low | Dev team | Accepted for now |
 
 ---
 
----
-
-**Document Version**: 2.0
-**Status**: Production Implementation Plan
+**Document Author**: Venkat Raman K S
