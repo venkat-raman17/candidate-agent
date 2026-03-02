@@ -259,7 +259,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph "Python Agent Process"
-        REG["MCPToolRegistry post_apply_tools[]"]
+        REG["MCPToolRegistry post_apply_tools[], schema_resources[], prompts[]"]
         PAA["post_apply_assistant"]
         REG --> PAA
     end
@@ -275,8 +275,8 @@ flowchart LR
             CC["ApplicationsClient"]
             JSC["JobClient"]
         end
-        subgraph "Resource Layer"
-            SR["Static Resources (schema, status mappings)"]
+        subgraph "Resource/Prompts Layer"
+            SR["Schema, status mappings, Prompts, Templates"]
         end
         PT --> TC
         AT --> CC
@@ -286,7 +286,7 @@ flowchart LR
     PAA -->|"Streamable HTTP JSON RPC 2.0 + App2App headers"| PT
     PAA -->|"Streamable HTTP JSON RPC 2.0 + App2App headers"| AT
     PAA -->|"Streamable HTTP JSON RPC 2.0 + App2App headers"| JT
-    REG -->|"startup: load schemas"| SR
+    REG -->|"Load resources & Prompts"| SR
 
     TC -->|"REST"| TPS[("talent-profile-service")]
     CC -->|"REST"| CXA[("cx-applications")]
