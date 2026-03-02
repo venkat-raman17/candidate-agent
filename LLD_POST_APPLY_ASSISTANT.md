@@ -76,7 +76,7 @@ and v2 routes into one.
 - Schema sharing strategy: `candidate-mcp` exposes `careers-data-schema` models as MCP static resources — available as a contract reference.
 - Resilience, observability, and caching
 - Testing strategy covering unit, integration, and contract tests
-- **Agent guardrails**: recursion limits (10 iterations), request timeouts (30 seconds), tool call limits (10 per request)
+- **Agent guardrails**: recursion limit (25 iterations), request timeout (30 seconds), tool call limit (10 per request)
 - **ID validation and anti-hallucination measures**: regex validation for all entity IDs, two-layer validation (schema + implementation)
 - **Convergence patterns and stop conditions**: tool calling sequence rules, explicit stop conditions, prohibition of speculative calls
 
@@ -94,6 +94,7 @@ and v2 routes into one.
 - `careers-data-schema` is a shared Maven library containing canonical Java domain models used across all backend services.
 - All service-to-service authentication uses App2App HMAC-SHA256 signature — both `careers-ai-service` → `candidate-mcp` and `candidate-mcp` → downstream services.
 - `candidate-mcp` is a stateless MCP server that calls real downstream services using App2App signature authentication.
+- `talent_profile_id` is set by `cx-web` BFF after user authentication and forwarded in trusted headers to `careers-ai-service`; it is not sourced from free-form user text.
 
 ---
 
@@ -688,8 +689,9 @@ All tool parameters representing entity IDs MUST be validated against these patt
 | Entity Type | Format Pattern | Valid Examples | Invalid Examples |
 |---|---|---|---|
 | **Job ID** | WD `R-XXX`, CP `CP-XXXX-XXXX` or `XXXXXXXX` | R-123456, CP-1234-5678, 12345678 | Cashier, R123, Engineer |
-| **Profile ID** | `UUID` | valid UUIDs | name, email |
+| **Profile ID (`talent_profile_id`)** | Header-derived canonical ID from authenticated `cx-web` BFF context | values issued by platform identity mapping | free text from prompt, name, email |
 | **Application document ID** | `UUID` | valid UUIDs | ats application id, job IDs |
+| **ATS requisition ID** | Canonical ATS requisition identifier (string) | values returned by `getActionableApplications` | free text job title, inferred IDs |
 
 **Validation occurs in two layers**:
 
@@ -926,6 +928,7 @@ sequenceDiagram
     participant PAA as post_apply_assistant
     participant CMCP as candidate-mcp
     participant CXA as cx-applications
+    participant JSS as job-sync-service
 
     User->>API: POST /api/v2/agent/invoke {"message": "What is the status of my applications?"}
     API->>PA: ainvoke(AgentState)
@@ -935,16 +938,16 @@ sequenceDiagram
     PA-->>API: Command(goto=post_apply_assistant)
 
     API->>PAA: ainvoke(AgentState)
-    note over PAA: LLM selects tools, aided<br/>by embedded schema context
+    note over PAA: LLM selects tools using prompt + tool schemas
 
-    PAA->>CMCP: getActionableApplications(talentProfileId) + WM-AUTH-SIGNATURE
+    PAA->>CMCP: getActionableApplications(talentProfileId) + WM_AUTH_SIGNATURE
     CMCP->>CXA: GET /v2/applications?talentProfileId={talentProfileId}
     CXA-->>CMCP: AtsApplicationDto (status, stage, history)
     CMCP-->>PAA: JSON  (fields match careers-data-schema)
 
-    PAA->>CMCP: getJobDetails([jobIds]) + WM-AUTH-SIGNATURE
-    CMCP->>CXA: GET /v1/unified-bulk-job-details?jobIds={jobIds}
-    CXA-->>CMCP: List~JobRequisitionDto~ (title, status, location, job type)
+    PAA->>CMCP: getJobDetails([jobIds]) + WM_AUTH_SIGNATURE
+    CMCP->>JSS: GET /v1/bulkUnifiedJobDetails?jobIds={jobIds}
+    JSS-->>CMCP: List~JobRequisitionDto~ (title, status, location, job type)
     CMCP-->>PAA: JSON
 
     note over PAA: LLM synthesises empathetic<br/>response from tool outputs
@@ -963,7 +966,7 @@ sequenceDiagram
     participant CMCP as candidate-mcp
     participant TPS as talent-profile-service
 
-    User->>API: POST /invoke {"message": "What is my assessment score?"}
+    User->>API: POST /api/v2/agent/invoke {"message": "What is my assessment score?"}
     API->>PA: ainvoke(AgentState)
 
     note over PA: Profile/assessment intent detected
@@ -991,7 +994,7 @@ sequenceDiagram
     participant PAA as post_apply_assistant
     participant CMCP as candidate-mcp
 
-    User->>API: POST /stream (SSE)
+    User->>API: POST /api/v2/agent/stream (SSE)
     API->>Graph: astream_events(input, version="v2")
 
     Graph-->>API: on_chain_start {name: post_apply_assistant}
@@ -1011,6 +1014,17 @@ sequenceDiagram
     Graph-->>API: on_chain_end
     API-->>User: event: done {active_agent, tool_calls}
 ```
+
+**SSE event contract (v2)**
+
+Each stream event uses stable event names and JSON payloads:
+- `handoff` — `{from, to}`
+- `tool_call` — `{name, args?}`
+- `token` — `{content}`
+- `done` — `{active_agent, tool_calls}`
+- `error` — `{error, message, retriable}`
+
+New event types are additive and backward compatible within v2.
 
 ### 6.5 Downstream Call with Resilience
 
@@ -1056,7 +1070,7 @@ to `candidate-mcp`, based on the working implementation from the prototype imple
 
 #### 7.1.1 Initialize MCP registry during FastAPI lifespan startup
 
-Load tools/resources once during startup, then attach them to app state so routes and
+Load tools once during startup, then attach them to app state so routes and
 dependencies reuse the same registry.
 
 ```python
@@ -1312,6 +1326,7 @@ flowchart LR
 | Principle | Implementation |
 |---|---|
 | **App2App — no shared user context** | The agent-to-MCP hop is machine-to-machine. No user bearer token is forwarded through the agent. |
+| **Identity-bound candidate context** | `talent_profile_id` is injected upstream by authenticated `cx-web` BFF and propagated as trusted context headers; the agent must not derive or override it from user text. |
 | **Replay attack prevention** | Signature TTL (default 5 min) prevents reuse of a captured signature. Clock skew tolerance is not added — clocks must be synchronised (NTP). |
 | **Least privilege (downstream)** | Each downstream service registers `candidate-mcp` with its own consumer_id and independent shared secret. Secrets are never shared across services. |
 | **No secrets in code** | Key secret (`CONSUMER_PRIVATE_KEY`) injected via Akeyless `Secret` → env variable. MCP service registry secrets stored in Akeyless Vault, never in `application.yml`. |
@@ -1598,9 +1613,9 @@ Redis instance for distributed state management of the LangGraph conversation ch
 ```mermaid
 flowchart LR
     subgraph "careers-ai-service instances"
-        W1["Worker 1 (MCP resource cache)"]
-        W2["Worker 2 (MCP resource cache)"]
-        WN["Worker N (MCP resource cache)"]
+        W1["Worker 1 (MCP tool registry)"]
+        W2["Worker 2 (MCP tool registry)"]
+        WN["Worker N (MCP tool registry)"]
     end
 
     subgraph "Shared Redis Cluster"
@@ -1656,6 +1671,14 @@ sequenceDiagram
 | TTL | 2 hours from last write | Matches expected candidate session length; prevents stale checkpoints accumulating |
 | Serialisation | JSON (LangGraph native) | Human-readable, inspectable in Redis CLI for debugging |
 | v1 graph checkpointer | Already in production on the same infra/tables | v2 rollout reuses proven production path |
+
+**Concurrency control (same `thread_id`)**
+
+To prevent checkpoint overwrite races when two requests use the same `thread_id` concurrently,
+v2 enforces a per-thread single-flight lock in Redis:
+- Acquire `langgraph:v2:lock:{thread_id}` with `SET NX EX 45`
+- If lock exists, return `409` with retriable `request_in_progress`
+- Release lock in `finally` to avoid stale locks
 
 ---
 
@@ -1748,7 +1771,7 @@ flowchart TB
 **Integration (Python — pytest)**
 - Handoff from primary to `post_apply_assistant` fires for recognised intent patterns.
 - `post_apply_assistant` reaches END with a non-empty response.
-- Schema resources are loaded and embedded in the system prompt during lifespan startup.
+- Schema resources are contract-validated in dedicated tests and are not loaded into prompts at startup.
 
 **Guardrail-Specific Tests**
 
@@ -1770,7 +1793,7 @@ flowchart TB
 
 **End-to-End**
 - Candidate asks for application status → `agent_used: post_apply_assistant`, response references atsRequisitionId.
-- Candidate asks for skills gap against a role → `getTalentProfile` and `getSkillsGap` both called.
+- Candidate asks assessment score → `getAssessmentResults` called and response includes pass/fail and next-step guidance when present.
 - `cx-applications` unavailable → user receives a degraded but helpful response.
 
 ---
@@ -1819,9 +1842,10 @@ flowchart TD
 | careers-agent (Python) | `GET /health` → 200 | `GET /health` → `mcp_connected: true` |
 | candidate-mcp (Java) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` |
 
-The readiness probe on `candidate-mcp` returns unhealthy if any circuit breaker is in
-the `OPEN` state, removing the pod from the load balancer until the downstream service
-recovers.
+`candidate-mcp` readiness reflects whether the MCP server can accept and process
+requests. Downstream circuit-breaker state is exposed through health details/metrics
+and alerts, but does not by itself mark the pod unready. This preserves graceful
+degraded responses during partial downstream outages.
 
 ### 14.3 Configuration Injection
 
@@ -1971,8 +1995,9 @@ assistant can still answer application status queries without job details.
 
 | ID | Issue / Risk | Severity | Owner | Status |
 |---|---|---|---|---|
-| R-01 | `langchain-mcp-adapters` does not natively support custom per-request header injection. The `SignatureProvider` must wrap or patch the httpx transport layer. Verify compatibility with `langchain-mcp-adapters 0.1.x`. Same httpx transport patch also enables shared connection pool for TLS reuse. | High | Dev team | Open — spike required |
+| R-01 | `langchain-mcp-adapters` per-request header injection must use a supported extension point (preferred) or a minimal transport wrapper fallback. Verify compatibility with `langchain-mcp-adapters 0.1.x`. The same wrapper must preserve shared `httpx.AsyncClient` pooling for TLS reuse. | High | Dev team | Open — implementation spike required |
 | R-02 | v1 and v2 graphs share no state. A user switching between `/api/v1` and `/api/v2` endpoints within the same session will lose conversation context. Cross-version thread continuity is not supported and must be communicated to consumers. | Low | Dev team | Accepted for now |
+| R-03 | Concurrent requests with the same `thread_id` can race and overwrite Redis checkpoint state if single-flight locking is not enforced. | Medium | Dev team | Open — add lock + tests |
 
 ---
 
