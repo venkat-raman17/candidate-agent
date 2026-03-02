@@ -40,7 +40,6 @@
 10. [Observability Design](#10-observability-design)
 11. [Caching Design](#11-caching-design)
     11.1 [LangGraph Thread State — Conversation Checkpointer](#111-langgraph-thread-state--conversation-checkpointer)
-    11.2 [Cache Hierarchy Summary](#112-cache-hierarchy-summary)
 12. [Error Handling](#12-error-handling)
 13. [Testing Strategy](#13-testing-strategy)
 14. [Deployment](#14-deployment)
@@ -1658,13 +1657,6 @@ sequenceDiagram
 | Serialisation | JSON (LangGraph native) | Human-readable, inspectable in Redis CLI for debugging |
 | v1 graph checkpointer | Already in production on the same infra/tables | v2 rollout reuses proven production path |
 
----
-
-### 11.2 Cache Hierarchy Summary
-
-| Cache | Owner | Storage | Namespace / Scope | What it prevents |
-|---|---|---|---|---|
-| Thread state (checkpointer) | careers-ai-service | Redis | `langgraph:v2:checkpoint:*` | Lost conversation context across workers and pods |
 ---
 
 ## 12. Error Handling
