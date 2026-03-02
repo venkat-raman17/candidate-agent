@@ -3,10 +3,9 @@
 
 | Field | Detail |
 |---|---|
-| **Document Version** | 2.1 |
-| **Status** | Production Ready |
+| **Document Version** | 1.0 |
+| **Status** | In-progress |
 | **Last Updated** | 2026-03-02 |
-| **Author** | Venkat Raman K S |
 | **Component** | careers-ai-service (existing, Add new Primary Assistant 2 with post_apply_assistant) · candidate-mcp (new) |
 | **Parent System** | Careers AI Platform |
 | **Depends On** | cx-applications · talent-profile-service · job-sync-service · careers-data-schema |
@@ -19,19 +18,31 @@
 2. [Glossary](#2-glossary)
 3. [System Context](#3-system-context)
 4. [Architecture Overview](#4-architecture-overview)
-5. [Schema Bridge — careers-data-schema to Python Agent](#5-schema-bridge--careers-data-schema-to-python-agent)
-6. [Component Design](#6-component-design) — 6.1 v2 API Route · 6.2 post_apply_assistant · 6.3 candidate-mcp · 6.4 Three-Layer Data Transformation Pipeline · 6.5 Data Model Extensions · 6.6 Agent Guardrails & Anti-Hallucination
-7. [Key Data Flows](#7-key-data-flows)
-8. [Integration Design](#8-integration-design)
-9. [Security Design](#9-security-design)
-10. [Resilience Design](#10-resilience-design)
-11. [Observability Design](#11-observability-design)
-12. [Caching Design](#12-caching-design) — 12.1 Schema Cache · 12.2 Thread Checkpointer · 12.3 Session Tool Cache · 12.4 MCP-side Tool Cache · 12.5 Summary
-13. [Error Handling](#13-error-handling)
-14. [Testing Strategy](#14-testing-strategy)
-15. [Deployment](#15-deployment)
-16. [Design Decisions](#16-design-decisions)
-17. [Open Issues & Risks](#17-open-issues--risks)
+5. [Component Design](#5-component-design)
+    5.1 [v2 API Route — careers-ai-service](#51-v2-api-route--careers-ai-service)
+    5.2 [post_apply_assistant — Sub-assistant](#52-post_apply_assistant--sub-assistant)
+    5.3 [candidate-mcp — Architecture](#53-candidate-mcp--architecture)
+    5.4 [Three-Layer Data Transformation Pipeline](#54-three-layer-data-transformation-pipeline)
+    5.5 [Agent Guardrails & Anti-Hallucination](#55-agent-guardrails--anti-hallucination)
+        5.5.1 [Recursion & Iteration Limits](#551-recursion--iteration-limits)
+        5.5.2 [ID Validation Strategy](#552-id-validation-strategy)
+        5.5.3 [Convergence Patterns](#553-convergence-patterns)
+6. [Key Data Flows](#6-key-data-flows)
+7. [Integration Design](#7-integration-design)
+8. [Security Design](#8-security-design)
+9. [Resilience Design](#9-resilience-design)
+10. [Observability Design](#10-observability-design)
+11. [Caching Design](#11-caching-design)
+    11.1 [MCP Static Resource Schema Cache — careers-ai-service side](#111-mcp-static-resource-schema-cache--careers-ai-service-side)
+    11.2 [LangGraph Thread State — Conversation Checkpointer](#112-langgraph-thread-state--conversation-checkpointer)
+    11.3 [Within-Session Tool Response Cache — careers-ai-service side](#113-within-session-tool-response-cache--careers-ai-service-side)
+    11.4 [Tool Response Cache — candidate-mcp side](#114-tool-response-cache--candidate-mcp-side)
+    11.5 [Cache Hierarchy Summary](#115-cache-hierarchy-summary)
+12. [Error Handling](#12-error-handling)
+13. [Testing Strategy](#13-testing-strategy)
+14. [Deployment](#14-deployment)
+15. [Design Decisions](#15-design-decisions)
+16. [Open Issues & Risks](#16-open-issues--risks)
 
 ---
 
@@ -294,44 +305,44 @@ The v2 graph uses its own `AgentState`. It does not share or modify the v1 state
 |---|---|---|---|
 | `messages` | `list[BaseMessage]` | `[]` | Conversation history (LangGraph managed) |
 | `talent_profile_id` | `str` | `""` | Candidate context for tool calls — **mandatory at the sub assistant boundary** |
-| `ats_application_id` | `str` | `""` | Optional. When set, the assistant focuses on this specific application. When absent, the assistant retrieves all applications for the candidate. |
+| `ats_requisition_id` | `str` | `""` | Optional. When set, the assistant focuses on this specific application. When absent, the assistant retrieves all applications for the candidate. |
+| `thread_id` | `str` | auto | Coversation thread ID |
 | `correlation_id` | `str` | auto | Request trace ID |
 
 #### State Injection into LLM Context — Callable Prompt Pattern
 
-LangGraph state fields such as `talent_profile_id` and `ats_application_id` are **not
+LangGraph state fields such as `talent_profile_id` and `ats_requisition_id` are **not
 automatically visible to the LLM**. The LLM operates only on the `messages` list.
 Without explicit injection the LLM will prompt the user to provide IDs it already has.
 
 Both `primary_assistant_2` and `post_apply_assistant` use **callable prompt
 functions** rather than static strings. At each inference step the callable reads
-the current state and appends an `## Active Request Context` block to the system
+the current state and appends an `Active Request Context` block to the system
 prompt before passing it to the LLM.
 
 ```mermaid
 flowchart LR
-    STATE["LangGraph State\n────────────────────\ntalent_profile_id: C002\nats_application_id: A001\nmessages: [...]"]
-    CALLABLE["Callable Prompt\n_build_context_block()\n────────────────────\nReads talent_profile_id\nReads ats_application_id\nBuilds context block"]
-    SYSMSG["System Message\n────────────────────\n...base prompt...\n\n## Active Request Context\ncandidateId: C002\napplicationId: A001\n<instruction>"]
-    LLM["LLM\n(has full context\nnever asks user\nfor IDs)"]
+    STATE["LangGraph State (talent_profile_id: C001, ats_requisition_id: R001, messages: [...])"]
+    CALLABLE["Callable Prompt _build_context_block(): Reads talent_profile_id, Reads ats_requisition_id -> Builds context block"]
+    SYSMSG["System Message ...base prompt... ## Active Request Context <instruction>"]
+    LLM["LLM (has full context never asks for IDs)"]
 
     STATE --> CALLABLE
     CALLABLE --> SYSMSG
     SYSMSG --> LLM
 ```
 
-The injected instruction differs based on whether `ats_application_id` is present:
+The injected instruction differs based on whether `ats_requisition_id` is present:
 
-| Scenario | `ats_application_id` in state | Instruction injected |
+| Scenario | `ats_requisition_id` in state | Instruction injected |
 |---|---|---|
-| v2 primary (with app) | set | "Route immediately — candidateId and applicationId are already known." |
-| v2 primary (no app) | empty | "Route immediately — candidateId is known. No specific application — the specialist will retrieve all applications." |
+| v2 primary (with app) | set | "Route immediately — talentProfileId and atsRequisitionId are already known." |
+| v2 primary (no app) | empty | "Route immediately — talentProfileId is known. No specific application — the specialist will retrieve all priority applications." |
 | post_apply (with app) | set | "A specific application is in scope. Use both IDs directly in tool calls." |
-| post_apply (no app) | empty | "No specific application was provided. Call `getApplicationsByCandidate(candidateId)` — do not ask the candidate for an application ID." |
+| post_apply (no app) | empty | "No specific application was provided. Call `getActionableApplications(talentProfileId)` " |
 
 This pattern ensures:
-- The LLM never asks the candidate to supply IDs already present in the request.
-- When `ats_application_id` is absent, `post_apply_assistant` automatically broadens its scope to the full application history rather than asking for clarification.
+- When `ats_requisition_id` is absent, `post_apply_assistant` automatically broadens its scope to the full applications list rather than asking for clarification.
 - The base prompt strings are built once at startup; the context block is appended cheaply per inference step with no additional LLM calls.
 
 #### Handoff Trigger Conditions
@@ -339,41 +350,32 @@ This pattern ensures:
 The primary assistant calls `transfer_to_post_apply_assistant` when the user's query
 concerns any of the following:
 
-- A candidate's profile, skills, or experience
+- A candidate's profile and job applications
 - Status, history, or timeline of a specific application
 - What happens next in the application process
 - Assessment results, scores, or completion status
-- Candidate preferences (location, role type, compensation)
-- How a candidate's profile compares to a role
+- Candidate preferences (location, job, renewal)
 
-#### Tool Set — 16 Tools
+#### Tool Set
 
-All tools are served by `candidate-mcp`. The sub-assistant has access to **16 tools** across
-four domains (validated through implementation implementation). The **Job** tool is used to enrich
+All tools are served by `candidate-mcp`. The sub-assistant has access to various **8 tools** across
+three domains. The **Job** tool is used to enrich
 application context: every application carries a `jobId`, so the assistant fetches job details
-(title, location, required assessment codes, job type) to give the candidate meaningful context
+(title, location, required assessment code, shift) to give the candidate meaningful context
 alongside their application status.
 
 | Domain | Tool | How it is used by post_apply_assistant |
 |---|---|---|
-| **Profile** (3 tools) | `getCandidateProfile` | Candidate's skills, experience, education |
-| | `getSkillsGap` | Gap between the candidate's profile and the applied role (requires `getJob` first to resolve the job) |
-| | `getCandidatePreferences` | Location, job type, work mode, and shift preferences (compensation expectations stripped as PII) |
-| **Application** (9 tools) | `getApplicationStatus` | Current stage, days in stage, SLA health |
-| | `getApplicationsByCandidate` | All applications for the candidate; each carries a `jobId` for enrichment |
-| | `getCandidateJourney` | Cross-application narrative with milestones |
-| | `getNextSteps` | Stage-specific candidate actions |
-| | `getStageDuration` | Days in the current stage |
-| | `getInterviewFeedback` | Interview rounds and any released notes |
-| | `getApplicationGroup` | Retrieve a draft multi-job application (candidate applied to 3-5 similar jobs in one session) |
-| | `getApplicationGroupsByCandidate` | All draft multi-job applications for a candidate |
-| | `getScheduledEvents` | Upcoming interview schedule with dates, times, interviewer names (IDs stripped as PII) |
-| **Job** (1 tool) | `getJob` | Enriches application context: resolves `jobId` → job title, location, required assessment codes, job type, department — provides the candidate with meaningful context about what they applied for |
-| **Assessment** (3 tools) | `getAssessmentResults` | All assessment results for the candidate |
-| | `getAssessmentByType` | Results filtered by type (used after `getJob` identifies required assessment codes) |
-| | `compareToPercentile` | Candidate's scores relative to the applicant pool |
+| **Profile** (3 tools) | `getTalentProfile` | Candidate's entire profile (PII striped) |
+| | `getPreferences` | Candidate's job, location preferences |
+| | `getAssessmentResults` | Candidate's assessment results |
+| **Application** (4 tools) | `getActionableApplications` | Sorted and grouped actionable applications list with SLA, status mapping |
+| | `getApplicationDetails` | Current stage, days in stage, workflow history, metadata |
+| | `getAtsApplications` | All the raw post-apply applications list (PII striped) |
+| | `getApplicationGroups` | All the raw pre-apply applications list (PII striped) |
+| **Job** (1 tool) | `getJobDetails` | Enriches application context: resolves `jobId` → job title, location, required assessment code, job type, shift |
 
-**Total**: 16 tools (12 original + 4 new enterprise tools validated in implementation)
+**Total**: 8 tools
 
 **Typical job enrichment pattern:**
 
@@ -382,34 +384,34 @@ sequenceDiagram
     participant PAA as post_apply_assistant
     participant CMCP as candidate-mcp
 
-    PAA->>CMCP: getApplicationsByCandidate(candidateId)
-    CMCP-->>PAA: [{ applicationId, jobId, status, stage, ... }, ...]
+    PAA->>CMCP: getActionableApplications(talentProfileId)
+    CMCP-->>PAA: [{ atsRequisitionId, jobId, status, stage, ... }, ...]
 
-    note over PAA: application contains jobId → enrich
+    note over PAA: applications contains jobId → enrich
 
-    PAA->>CMCP: getJob(jobId)
-    CMCP-->>PAA: { title, location, department, requiredAssessmentCodes, jobType }
+    PAA->>CMCP: getJobDetails(jobIds)
+    CMCP-->>PAA: { title, location, requiredAssessmentCode, shift }
 
-    note over PAA: now has full context to answer<br/>"Where is this job?", "What assessments<br/>are required?", "What is the role?"
+    note over PAA: now has full context to answer<br/>"Where is this job?", "What assessments<br/>are required?", "What is the job title?"
 ```
 
 ---
 
-### 6.3 candidate-mcp — Architecture
+### 5.3 candidate-mcp — Architecture
 
-`candidate-mcp` is a stateless Spring AI MCP server. Every tool handler calls the
-appropriate downstream service, passes the response through `AgentContextTransformer`
+`candidate-mcp` is a stateless MCP server built from java MCP starter kit. Every tool handler calls the
+appropriate downstream service, passes the response through `ContextTransformer`
 to strip PII and project agent-safe fields, and returns the result as JSON.
-`candidate-mcp` is the single point where raw Cosmos data is sanitised — no PII or
-internal metadata ever reaches the Python agent or the LLM.
+`candidate-mcp` is the single point where raw backend data is sanitised — no PII or
+internal metadata ever reaches the agents or the LLM.
 
 #### Downstream Service Responsibilities
 
 | Service | Tools it backs | Data it provides |
 |---|---|---|
-| `talent-profile-service` | `getCandidateProfile`, `getSkillsGap`, `getAssessmentResults`, `getAssessmentByType`, `compareToPercentile` | Candidate profiles, skill records, assessment results from Cosmos |
-| `cx-applications` | `getApplicationStatus`, `getApplicationsByCandidate`, `getCandidateJourney`, `getNextSteps`, `getStageDuration`, `getInterviewFeedback` | Application documents, stage history, interview notes from Cosmos |
-| `job-sync-service` | `getJob` | Job requisition details — title, location, department, assessment codes, job type |
+| `talent-profile-service` | `getTalentProfile`, `getPreferences`, `getAssessmentResults` | Candidate profiles, questionnaire responses, assessment results and preferences |
+| `cx-applications` | `getActionableApplications`, `getApplicationDetails`, `getAtsApplications`, `getApplicationGroups` | Application documents, stage history, statuses |
+| `job-sync-service` | `getJobDetails` | Job requisition details — title, location, assessment codes, job type, shift details |
 
 #### Package Structure
 
@@ -419,16 +421,16 @@ candidate-mcp/
 │   ├── McpConfiguration          Tool & resource registration
 │   ├── WebClientConfiguration    One WebClient bean per downstream service
 │   ├── ResilienceConfiguration   Circuit breaker & retry registries
-│   └── SecurityConfiguration     App2App signature filter (inbound) + SignatureProvider (outbound)
+│   └── SecurityConfiguration     App2App SignatureProvider (outbound) - inbound is handled by MCP's sidecar
 ├── tool/
 │   ├── ProfileTools              Delegates to TalentProfileClient → transformer
 │   ├── ApplicationTools          Delegates to CxApplicationsClient → transformer
 │   ├── JobTools                  Delegates to JobSyncClient → transformer
 │   └── AssessmentTools           Delegates to TalentProfileClient → transformer
 ├── transformer/
-│   └── AgentContextTransformer   PII strip + field projection for each domain
+│   └── ContextTransformer   PII strip + field projection for each domain
 ├── resource/
-│   └── StaticResources           Serialises careers-data-schema → JSON Schema MCP resources
+│   └── StaticResources           Status mappings, Serialises careers-data-schema → JSON Schema MCP resources
 ├── client/
 │   ├── TalentProfileClient       WebClient wrapper for talent-profile-service
 │   ├── CxApplicationsClient      WebClient wrapper for cx-applications
@@ -444,32 +446,31 @@ candidate-mcp/
 
 | Concern | Technology |
 |---|---|
-| Framework | Spring Boot 3.5 · Java 21 |
-| MCP SDK | Spring AI 1.1.x (stateless streamable HTTP) |
+| Framework | Spring Boot · Java 21 |
+| MCP SDK | Spring AI (stateless streamable HTTP) |
 | HTTP client | WebClient (Project Reactor) + virtual threads for safe blocking in MCP handlers |
 | Domain models | `careers-data-schema` (Maven compile dependency) |
 | Auth (inbound from agent) | App2App HMAC-SHA256 signature validation |
-| Auth (outbound to downstream) | App2App HMAC-SHA256 signature — one shared secret per downstream service |
+| Auth (outbound to downstream) | App2App HMAC-SHA256 signature — one shared secret for all downstream services |
 | Resilience | Resilience4j — circuit breaker + retry, one instance per downstream service |
-| Observability | Micrometer + OpenTelemetry (OTLP exporter) |
-| Caching | Spring Cache + Redis (tool-level cache for stable entity data) |
+| Observability | Micrometer + OpenTelemetry |
 
 ---
 
-### 6.4 Three-Layer Data Transformation Pipeline
+### 5.4 Three-Layer Data Transformation Pipeline
 
 Data passes through three distinct transformation stages before reaching the candidate.
 Each layer has a single, well-bounded responsibility.
 
 ```mermaid
 flowchart TD
-    RAW["Cosmos Document\n────────────────────────────────\nFull record · all fields\nPII included · internal metadata\nDatabase artefacts · audit fields\nraw from cx-applications /\ntalent-profile-service"]
+    RAW["Backend services · Cosmos Document Full record · all fields PII included · internal metadata Database artifacts · audit fields"]
 
-    L1["Layer 1 — candidate-mcp Transformer\n────────────────────────────────\nPII stripped · internal fields dropped\nProjected into AgentContext DTOs\nAgent-neutral: same output regardless\nof which assistant calls this tool"]
+    L1["Layer 1 — candidate-mcp Transformer · PII stripped · internal fields dropped · Projected into AgentContext DTOs · Agent-neutral: same output regardless of which assistant calls this tool"]
 
-    L2["Layer 2 — post_apply_assistant Context Filter\n────────────────────────────────\nQuery-specific field selection\nOnly what this LLM turn needs\nReduces context window consumption\nPrevents LLM reasoning over noise"]
+    L2["Layer 2 — post_apply_assistant Context Filter · Query-specific field selection · Only what this LLM turn needs · Reduces context window consumption · Prevents LLM reasoning over noise"]
 
-    L3["Layer 3 — post_apply_assistant Response Formatter\n────────────────────────────────\nCandidate-facing persona\nATS codes → human language\nEmpathetic · jargon-free · actionable\nDriven by system prompt + response templates"]
+    L3["Layer 3 — post_apply_assistant Response Formatter · Candidate-facing persona · Human language · Empathetic · jargon-free · actionable · Driven by system prompt + response templates"]
 
     OUT(["Candidate-facing Response"])
 
@@ -479,7 +480,7 @@ flowchart TD
     L3 --> OUT
 ```
 
-#### Layer 1 — candidate-mcp Transformer
+#### **Layer 1 — MCP Transformer**
 
 `candidate-mcp` is **agent-neutral**: it does not know which assistant or which user
 type is calling it. Every tool handler maps the raw downstream response to a projected
@@ -491,7 +492,6 @@ type is calling it. Every tool handler maps the raw downstream response to a pro
 |---|---|
 | Direct identifiers | National ID / NI number, passport number, exact date of birth |
 | Contact details | Personal phone number, home address lines, personal email |
-| Financial | Exact current salary, bank details, compensation history |
 | Internal ATS | Database row IDs, audit `created_by` / `modified_by`, internal routing codes, lock/version fields |
 | Downstream artefacts | Cosmos `_etag`, `_ts`, partition keys, internal service correlation IDs |
 
@@ -499,36 +499,27 @@ type is calling it. Every tool handler maps the raw downstream response to a pro
 
 | Domain | Included Fields |
 |---|---|
-| Candidate | Candidate ID, display name, skills list, years of experience, education summary, `CandidateStatus` enum |
-| Application | Application ID, job ID, `ApplicationStatus` enum, current stage name, days in current stage, SLA flag, stage history (stage + date only), source enum |
-| Assessment | Assessment ID, `AssessmentType` enum, score, percentile, completion date, pass/fail indicator |
-| Job | Job ID, title, department, required skills, `JobType` enum |
+| Profile | Candidate ID, display name, Assessment results with status details |
+| Application | Application ID, job ID, status enums, current stage name, days in current stage, SLA, stage history, ats source |
+| Job | Job ID, title, job type, location, shift details |
 
 ```mermaid
 flowchart LR
     subgraph "candidate-mcp tool handler"
-        RAW_DTO["Raw downstream DTO\n(full Cosmos fields)"]
-        PROJ["AgentContextTransformer\n· strip PII fields\n· drop internal metadata\n· map enums to stable names\n· compute derived fields\n  (days in stage, SLA breached)"]
-        AC["AgentContext DTO\n(projected · safe · stable)"]
+        RAW_DTO["Raw downstream DTO (full Cosmos fields)"]
+        PROJ["ContextTransformer · strip PII fields · drop internal metadata · map enums to stable names · compute derived fields"]
+        AC["AgentContext DTO (projected · safe · stable)"]
 
         RAW_DTO --> PROJ --> AC
     end
 
-    CMCP_OUT["MCP tool result JSON\n→ post_apply_assistant"]
+    CMCP_OUT["MCP tool result JSON → post_apply_assistant"]
     AC --> CMCP_OUT
 ```
 
-Derived fields computed during projection (not stored in Cosmos):
-
-| Derived Field | Computation |
-|---|---|
-| `daysInCurrentStage` | `today - stageEnteredDate` |
-| `slaBreached` | `daysInCurrentStage > workflowStage.slaDays` |
-| `experienceSummary` | Aggregated from work history (years + last role title only) |
-
 ---
 
-#### Layer 2 — post_apply_assistant Context Filter
+#### **Layer 2 — Post Apply Assistant Context Filter**
 
 The `post_apply_assistant` receives the agent-neutral context from Layer 1 — which is
 already PII-safe but may still contain fields irrelevant to the current query. A
@@ -537,59 +528,53 @@ usage predictable.
 
 This filter operates in two complementary ways:
 
-**System prompt instructions (primary)**
+**System prompt instructions**
 The `post_apply_assistant` system prompt includes explicit field-focus directives.
 The LLM is told which fields to prioritise for each query type and to disregard the
 rest.
 
 ```mermaid
 flowchart LR
-    TOOL_RESULT["MCP tool result\n(all projected fields)"]
+    TOOL_RESULT["MCP tool result (all projected fields)"]
 
-    subgraph "post_apply_assistant system prompt"
-        DIR["Field focus directives\n────────────────────\nFor status queries: use stage,\ndaysInCurrentStage, slaBreached,\nstatusHistory — ignore skills/assessment\n\nFor assessment queries: use score,\npercentile, assessmentType — ignore\napplication stage history"]
+    subgraph "post_apply_assistant"
+        subgraph "system prompt"
+            DIR["Field focus directives"]
+        end
     end
 
-    LLM["LLM reasoning\n(attends to relevant fields\nper directive)"]
+    LLM["LLM reasoning (attends to relevant fields per directive)"]
 
     TOOL_RESULT --> LLM
     DIR --> LLM
 ```
 
 **Programmatic filter (for large payloads)**
-Where a tool response may contain many items (e.g. `getApplicationsByCandidate`
-returning a list with full history per application), a Python `ContextFilter` class
+Where a tool response may contain many items (e.g. `getActionableApplications`
+returning a list with many context fields), an agent `ContextFilter`
 trims the payload before it enters the LLM message. This is a safety net for
 token-budget control, not the primary filtering mechanism.
 
-| Tool | Programmatic Trim |
-|---|---|
-| `getApplicationsByCandidate` | Include only `applicationId`, `jobTitle`, `status`, `currentStage` per item; drop full `statusHistory` from list view |
-| `getCandidateJourney` | Limit to the 5 most recent milestone events |
-| `getInterviewFeedback` | Include rounds list with dates and outcomes; omit full verbatim notes unless explicitly requested |
-| Other tools | No programmatic trim — payload is already compact |
-
 ---
 
-#### Layer 3 — post_apply_assistant Response Formatter
+#### **Layer 3 — post_apply_assistant Response Formatter**
 
-The `post_apply_assistant` faces the actual candidate, not an internal HR user or a
-developer. Its system prompt and response templates are designed for that audience:
+The `post_apply_assistant` faces the actual candidate. Its system prompt and response templates are designed for that audience:
 clear, empathetic, jargon-free, and actionable.
 
 **System prompt — candidate persona directives:**
 
 ```mermaid
 flowchart TD
-    SP["post_apply_assistant System Prompt\n────────────────────────────────"]
+    SP["post_apply_assistant System Prompt"]
 
-    SP --> T1["Tone\n· Warm and professional\n· First person plural when\n  referring to the process\n  ('we're reviewing your...')\n· Never expose internal tool names\n  or field keys to the candidate"]
+    SP --> T1["Tone · Warm and professional · First person plural when   referring to the process · Never expose internal tool names   or field keys to the candidate"]
 
-    SP --> T2["ATS Code Mapping\n· TECHNICAL_SCREEN → 'technical interview stage'\n· OFFER_EXTENDED → 'an offer has been made'\n· REJECTED → 'not moved forward at this time'\n· SLA breached → 'taking longer than usual'"]
+    SP --> T2["Status mappings to human descriptive response"]
 
-    SP --> T3["Response Structure\n· Lead with the current status clearly\n· Follow with what happens next\n· End with a concrete action if one exists\n· Never speculate on timeline if not in data"]
+    SP --> T3["Response Structure · Lead with the current status clearly · Follow with what happens next · End with a concrete action if one exists · Never speculate on timeline if not in data"]
 
-    SP --> T4["Sensitive Topics\n· Rejection: constructive, forward-looking,\n  reference strengths where data supports\n· Offer: factual summary, do not advise\n  on negotiation or decision\n· Delays: honest, no false reassurance"]
+    SP --> T4["Sensitive Topics · Rejection: constructive, forward-looking · Offer: factual summary, do not advise on negotiation or decision · Delays: honest, no false reassurance"]
 ```
 
 **Named Response Templates**
@@ -601,293 +586,31 @@ LLM fills in the candidate-specific data; the template enforces the shape.
 |---|---|---|
 | `status-update` | "What's the status of my application?" | Current stage → time in stage (relative) → what happens next |
 | `next-steps-guide` | "What should I do now?" / "What do I need to prepare?" | Stage-specific actions → preparation tips → expected timeline |
-| `assessment-summary` | "How did I do in the assessment?" | Score context (percentile band) → pass/fail → next stage if passed |
-| `rejection-debrief` | Application status is `REJECTED` | Acknowledgement → strengths noted (if data available) → encourage reapply eligibility |
-| `journey-overview` | "Can you walk me through all my applications?" | Chronological list → status per application → any requiring action |
+| `assessment-summary` | "How did I do in the assessment?" | Score context → pass/fail → next stage if passed |
+| `rejection-debrief` | Application status is `REJECTED` | Acknowledgement → details if reason available |
+| `workflow-overview` | "Can you walk me through all the statuses of my application?" | Chronological list → statuses in history data → any requiring action |
 
 ---
 
-### 6.5 Data Model Extensions (Validated in implementation)
+### 5.5 Agent Guardrails & Anti-Hallucination
 
-The implementation validated several enterprise data model extensions that must be added to
-`careers-data-schema` for production deployment. These extensions address real-world
-candidate and recruiter workflows not covered by the baseline ATS schema.
+This section describes critical production guardrails implemented to prevent infinite loops, ID hallucination, and other agent failure modes.
 
-#### 6.5.1 ApplicationGroups — Multi-Job Applications
+#### 5.5.1 Recursion & Iteration Limits
 
-**Motivation**: Enterprise candidates often apply to multiple similar jobs in one session
-(e.g., "SRE" → apply to 5 SRE jobs across different teams). Forcing separate applications
-for each job creates friction and lower completion rates.
-
-**Data Model** (add to `careers-data-schema` v1.6.0):
-
-```java
-public record ApplicationGroup(
-    String groupId,                         // Primary key: "AG001"
-    String candidateId,                     // Foreign key to CandidateProfile
-    List<String> jobIds,                    // 3-5 job IDs
-    ApplicationGroupStatus status,          // DRAFT, SUBMITTED, ABANDONED
-    int completionPercentage,               // 0-100% (calculated)
-    LocalDateTime createdAt,
-    LocalDateTime lastUpdatedAt,
-    Map<String, String> sharedResponses     // Questionnaire responses common to all jobs
-) {}
-
-public enum ApplicationGroupStatus {
-    DRAFT,       // In progress, not submitted
-    SUBMITTED,   // Converted to individual AtsApplications
-    ABANDONED    // >30 days idle
-}
-```
-
-**New Tools**:
-- `getApplicationGroup(groupId)` — Retrieve a draft multi-job application
-- `getApplicationGroupsByCandidate(candidateId)` — All draft applications for a candidate
-
-**Integration Required**:
-1. Add `ApplicationGroup` to `careers-data-schema` (schema version 1.6.0)
-2. Add `GET /api/v1/application-groups/{groupId}` to `cx-applications`
-3. Add `GET /api/v1/application-groups?candidateId={cid}` to `cx-applications`
-4. Add `POST /api/v1/application-groups/{groupId}/submit` to convert to AtsApplications
-
-
----
-
-#### 6.5.2 Shift Details — First-Class Job Attribute
-
-**Motivation**: Operations, SRE, support, and manufacturing roles require shift-based hiring.
-Candidates filter jobs by acceptable shift types before applying. Without first-class shift
-data, matching is manual and error-prone.
-
-**Data Model** (add to `JobRequisition` in `careers-data-schema` v1.6.0):
-
-```java
-public record JobRequisition(
-    // ... existing fields
-    ShiftDetails shift                      // NEW: Shift requirements
-) {}
-
-public record ShiftDetails(
-    ShiftType type,                         // DAY, NIGHT, ROTATING, FLEXIBLE
-    String timezone,                        // "America/Los_Angeles"
-    String startTime,                       // "09:00" (24h format)
-    String endTime,                         // "17:00"
-    List<String> workDays                   // ["MONDAY", "TUESDAY", ...]
-) {}
-
-public enum ShiftType {
-    DAY,                                    // 9-5, business hours
-    NIGHT,                                  // Overnight/graveyard
-    ROTATING,                               // Alternates between day/night
-    FLEXIBLE,                               // Candidate chooses
-    ON_CALL                                 // On-call rotation
-}
-
-// ADD TO CandidatePreferences in careers-data-schema
-public record WorkStylePreferences(
-    // ... existing fields
-    List<ShiftType> acceptableShifts       // NEW: Candidate's shift preferences
-) {}
-```
-
-**Use Case**: "Show me day shift jobs" → filters by `shift.type == DAY` and matches
-`candidate.preferences.acceptableShifts`
-
-
----
-
-#### 6.5.3 Assessment Code Mapping — Standardized Codes
-
-**Motivation**: Skills gap analysis requires matching required assessment codes (from job)
-with completed assessment codes (from candidate). Unstandardized codes break matching.
-
-**Data Model** (add to `JobRequisition` and `AssessmentResult` in `careers-data-schema` v1.6.0):
-
-```java
-// ADD TO JobRequisition
-public record JobRequisition(
-    // ... existing fields
-    AssessmentCodeMapping assessments      // NEW: Required assessment codes
-) {}
-
-public record AssessmentCodeMapping(
-    List<String> requiredCodes,            // ["JAVA_01", "SYS_DESIGN_02", "KUBERNETES_03"]
-    List<String> preferredCodes            // Optional but beneficial
-) {}
-
-// ADD TO AssessmentResult
-public record AssessmentResult(
-    String assessmentCode,                 // MUST match JobRequisition.assessments.requiredCodes
-    // ... other fields
-) {}
-```
-
-**Central Registry** (must be maintained in shared config service):
-
-```yaml
-# Central registry of standardized assessment codes
-JAVA_01:
-  name: "Java Core Concepts"
-  description: "OOP, collections, concurrency"
-  type: TECHNICAL
-
-SYS_DESIGN_02:
-  name: "System Design — Distributed Systems"
-  description: "Scalability, consistency, partitioning"
-  type: DESIGN
-
-KUBERNETES_03:
-  name: "Kubernetes Operations"
-  description: "Deployment, scaling, troubleshooting"
-  type: DEVOPS
-```
-
-**Integration Required**:
-1. Add `AssessmentCodeMapping` to JobRequisition (job-sync-service)
-2. Add `assessmentCode` field to AssessmentResult (talent-profile-service)
-3. Maintain central code registry in shared config service
-4. Update `getSkillsGap` tool to use standardized codes for matching
-
-
----
-
-#### 6.5.4 Interview Schedule Metadata — PII Nuance
-
-**Motivation**: Candidates need to know who they'll speak with and when, but interviewer
-internal IDs are PII. The implementation validated a nuanced PII decision: **names are safe,
-IDs are PII**.
-
-**Data Model** (add to `AtsApplication` in `careers-data-schema` v1.6.0):
-
-```java
-// ADD TO AtsApplication
-public record AtsApplication(
-    // ... existing fields
-    List<ScheduledEvent> upcomingEvents    // NEW: Interview schedule
-) {}
-
-public record ScheduledEvent(
-    String eventId,
-    EventType type,                        // PHONE_SCREEN, TECHNICAL_INTERVIEW, etc.
-    LocalDateTime scheduledAt,
-    int durationMinutes,
-    List<String> interviewerNames,         // ✅ SAFE: Transparency for candidate
-    List<String> interviewerIds,           // ❌ PII: Internal employee IDs (STRIP in Layer 1)
-    String location,                       // Zoom link or office room
-    String internalNotes                   // ❌ PII: Recruiter notes (STRIP in Layer 1)
-) {}
-```
-
-**AgentContext Projection** (Layer 1 strips IDs and internal notes):
-
-```java
-public record ScheduledEventSummary(
-    String eventId,
-    EventType type,
-    LocalDateTime scheduledAt,
-    int durationMinutes,
-    List<String> interviewerNames,         // ✅ RETAINED: Safe, beneficial to candidate
-    // STRIPPED: interviewerIds              ❌ PII
-    // STRIPPED: internalNotes                ❌ PII
-    String location
-) {}
-```
-
-**Rationale**:
-- **Interviewer names** provide transparency and humanize the process ("You'll meet with Sarah Chen, Engineering Manager")
-- **Interviewer IDs** are internal identifiers with no candidate value (`interviewerId: "EMP12345"`)
-
-**New Tool**: `getScheduledEvents(applicationId)` — Upcoming interview schedule with names (NOT IDs)
-
-
----
-
-#### 6.5.5 SLA Tracking — Derived Field Pattern
-
-**Decision**: SLA tracking is **computed on-the-fly in the transformer**, NOT stored in Cosmos.
-
-**Why**:
-1. Avoids database bloat (no SLA fields in Cosmos documents)
-2. Avoids stale data (SLA recalculated on every read)
-3. Centralized logic (one `SlaCalculator` utility class)
-
-**Implementation** (validated in implementation):
-
-```java
-// Utility class: SlaCalculator.java
-public final class SlaCalculator {
-    private static final Map<String, Integer> SLA_THRESHOLDS = Map.of(
-        "SCREENING", 2,
-        "TECHNICAL_INTERVIEW", 7,
-        "HIRING_MANAGER_INTERVIEW", 5,
-        "OFFER_PREPARATION", 3,
-        "OFFER_EXTENDED", 5
-    );
-
-    public static long calculateDaysInStage(LocalDateTime lastTransitionTime) {
-        if (lastTransitionTime == null) return 0;
-        return Duration.between(lastTransitionTime, LocalDateTime.now()).toDays();
-    }
-
-    public static boolean isSlaBreached(String stageName, long daysInStage) {
-        Integer threshold = SLA_THRESHOLDS.get(stageName);
-        return threshold != null && daysInStage > threshold;
-    }
-}
-```
-
-**Usage in ApplicationTransformer**:
-
-```java
-@Override
-public ApplicationAgentContext transform(AtsApplication source) {
-    // ... field mapping
-
-    long daysInCurrentStage = SlaCalculator.calculateDaysInStage(
-        source.lastStageTransitionAt()
-    );
-    boolean slaBreached = SlaCalculator.isSlaBreached(
-        source.currentStage(),
-        daysInCurrentStage
-    );
-
-    return new ApplicationAgentContext(
-        // ... other fields
-        daysInCurrentStage,    // Computed: now - lastStageTransitionAt
-        slaBreached            // Computed: daysInCurrentStage > threshold
-    );
-}
-```
-
-
----
-
-### 6.6 Agent Guardrails & Anti-Hallucination
-
-This section describes critical production guardrails implemented to prevent infinite loops, ID hallucination, and other agent failure modes discovered during testing.
-
-#### 6.6.1 Recursion & Iteration Limits
-
-**Problem**: Without hard limits, the agent can enter infinite tool-calling loops, consuming resources and providing poor user experience (observed: 600+ observations, 4+ minute execution time).
+**Problem**: Without hard limits, the agent can enter infinite tool-calling loops, consuming resources and providing poor user experience.
 
 **Solution — Three-Layer Limit Strategy**:
 
 | Layer | Limit | Configuration | Purpose |
 |---|---|---|---|
 | **StateGraph recursion_limit** | 25 iterations | `StateGraph(AgentState, recursion_limit=25)` | Hard stop on LangGraph execution — prevents infinite graph loops |
-| **Request timeout** | 60 seconds | `asyncio.wait_for(agent_executor.ainvoke(), timeout=60.0)` | Hard stop at API layer — protects backend resources |
+| **Request timeout** | 30 seconds | `asyncio.wait_for(agent_executor.ainvoke(), timeout=30.0)` | Hard stop at API layer — protects backend resources |
 | **Tool call limit per request** | 10 tool calls | Tracked in `AgentState.tool_call_count` | Soft limit — agent returns helpful message when exceeded |
 
-**Implementation** (validated in production):
+**Implementation**:
 
 ```python
-# File: careers-ai-service/src/agent/v2_graph.py
-from langgraph.graph import StateGraph
-
-# BEFORE (Missing recursion limit)
-graph = StateGraph(AgentState)
-
-# AFTER (With strict recursion limit)
 graph = StateGraph(
     AgentState,
     recursion_limit=25  # Max 25 iterations before hard stop
@@ -896,24 +619,20 @@ graph = StateGraph(
 
 **Rationale**:
 - Prevents infinite loops and runaway requests
-- 25 iterations = approximately 5-7 tool calls with reasonable reasoning steps
+- 15 iterations = approximately 3-4 tool calls with reasonable reasoning steps
 - Industry standard for production LLM agents
 - Provides multiple layers of protection (graph-level, API-level, application-level)
 
 **Request-Level Timeout Implementation**:
 
 ```python
-# File: careers-ai-service/src/api/v2_routes.py
-import asyncio
-from fastapi import HTTPException
-
 @router.post("/api/v2/agent/invoke")
 async def invoke_agent(request: AgentRequest):
     try:
-        # Add 60-second timeout for entire request
+        # Add 30-second timeout for entire request
         result = await asyncio.wait_for(
             agent_executor.ainvoke(request),
-            timeout=60.0  # 60 seconds max
+            timeout=30.0  # 30 seconds max
         )
         return result
     except asyncio.TimeoutError:
@@ -926,18 +645,6 @@ async def invoke_agent(request: AgentRequest):
 **Tool Call Tracking in State**:
 
 ```python
-# File: careers-ai-service/src/agent/v2_graph.py
-from typing import TypedDict, Annotated
-from langgraph.graph.message import add_messages
-
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
-    talent_profile_id: str
-    ats_application_id: str | None
-    tool_call_count: int  # NEW: Track tool calls
-    tools_called: list[str]  # NEW: Track which tools were called
-
-def call_model(state: AgentState):
     # Increment tool call counter
     tool_call_count = state.get("tool_call_count", 0)
 
@@ -968,9 +675,9 @@ def call_model(state: AgentState):
 
 ---
 
-#### 6.6.2 ID Validation Strategy
+#### 5.5.2 ID Validation Strategy
 
-**Problem**: Agent hallucinates entity IDs by inferring them from names/titles (observed: "Senior SRE" → "JSeniorSRE", causing `Job not found: JSeniorSRE` errors).
+**Problem**: Agent hallucinates entity IDs by inferring them from names/titles.
 
 **Solution — Two-Layer Validation**:
 
@@ -978,95 +685,28 @@ All tool parameters representing entity IDs MUST be validated against these patt
 
 | Entity Type | Format Pattern | Valid Examples | Invalid Examples |
 |---|---|---|---|
-| **Job IDs** | `^J\d{3}$` | J001, J002, J003 | JSeniorSRE, job-001, senior-sre |
-| **Application IDs** | `^A\d{3}$` | A001, A002, A003 | app-001, application-1 |
-| **Candidate IDs** | `^C\d{3}$` | C001, C002, C003 | candidate-1, C1 |
-| **Group IDs** | `^AG\d{3}$` | AG001, AG002 | group-001, AG1 |
+| **Job ID** | WD `R-XXX`, CP `CP-XXXX-XXXX` or `XXXXXXXX` | R-123456, CP-1234-5678, 12345678 | Cashier, R123, Engineer |
+| **Profile ID** | `UUID` | valid UUIDs | name, email |
+| **Application document ID** | `UUID` | valid UUIDs | ats application id, job IDs |
 
 **Validation occurs in two layers**:
 
 ```mermaid
 flowchart LR
-    LLM["LLM generates\ntool call"]
-    SCHEMA["Layer 1: Tool Schema\n(Pydantic/JSON Schema)\nDocuments format\nin description"]
-    IMPL["Layer 2: Tool Implementation\n(Java @Tool method)\nRejects invalid format\nbefore downstream call"]
+    LLM["LLM generates tool call"]
+    SCHEMA["Layer 1: Tool Schema (Pydantic/JSON Schema) Documents format in description"]
+    IMPL["Layer 2: Tool Implementation (Java @Tool method) Rejects invalid format before downstream call"]
     DS["Downstream Service"]
 
     LLM --> SCHEMA
     SCHEMA --> IMPL
     IMPL -->|"Valid ID"| DS
-    IMPL -->|"Invalid ID"| ERROR["Structured Error\nreturned to LLM"]
+    IMPL -->|"Invalid ID"| ERROR["Structured Error returned to LLM"]
 ```
-
-**Layer 1 — Tool Schema Improvements** (teaches LLM correct format):
-
-```java
-// File: candidate-mcp/src/main/java/com/example/mcpserver/tools/JobTools.java
-
-// BEFORE (Vague schema — leads to hallucination)
-@Tool(
-    description = "Get detailed information about a specific job requisition"
-)
-public JobRequisition getJob(
-    @ToolParam(description = "Job ID") String jobId
-) { ... }
-
-// AFTER (Strict schema with format and examples)
-@Tool(
-    description = """
-    Get detailed information about a specific job requisition.
-
-    IMPORTANT: job_id must be the EXACT job ID (format: J + 3 digits).
-    DO NOT guess or infer job IDs from job titles.
-    ONLY use job IDs returned from getApplicationsByCandidate or other tools.
-
-    Examples of valid job IDs: J001, J002, J003
-    Examples of INVALID job IDs: JSeniorSRE, job-001, senior-sre
-    """
-)
-public JobRequisition getJob(
-    @ToolParam(
-        description = "Exact job ID in format J### (e.g., J001, J002). DO NOT infer from job title.",
-        required = true
-    )
-    String jobId
-) { ... }
-```
-
-**Layer 2 — Input Validation in Tool Implementation** (fails fast with clear error):
-
-```java
-// File: candidate-mcp/src/main/java/com/example/mcpserver/tools/JobTools.java
-import java.util.regex.Pattern;
-
-private static final Pattern JOB_ID_PATTERN = Pattern.compile("^J\\d{3}$");
-private static final Pattern ats_application_id_PATTERN = Pattern.compile("^A\\d{3}$");
-private static final Pattern talent_profile_id_PATTERN = Pattern.compile("^C\\d{3}$");
-
-@Tool(description = "...")
-public JobRequisition getJob(@ToolParam(...) String jobId) {
-    // Validate ID format BEFORE calling downstream service
-    if (!JOB_ID_PATTERN.matcher(jobId).matches()) {
-        throw new IllegalArgumentException(String.format(
-            "Invalid job_id format: '%s'. Expected format: J### (e.g., J001, J002). " +
-            "Do not guess job IDs. Use exact IDs from getApplicationsByCandidate() results.",
-            jobId
-        ));
-    }
-
-    return jobSyncClient.getJob(jobId)
-        .orElseThrow(() -> new NotFoundException("Job not found: " + jobId));
-}
-```
-
-**Rationale**:
-- Fails fast with clear error message that teaches the agent correct format
-- Prevents downstream service calls with invalid IDs (reduces load, faster failure)
-- Error message becomes part of LLM context, improving future tool calls in same conversation
 
 ---
 
-#### 6.6.3 Convergence Patterns
+#### 5.5.3 Convergence Patterns
 
 **Problem**: Agent calls tools repeatedly without making progress toward answering the user's question.
 
@@ -1076,69 +716,60 @@ The agent follows these convergence patterns to ensure it stops when sufficient 
 
 **1. Tool Call Sequencing**: Call foundational tools first before detail tools
 
-| Query Type | Correct Sequence | Anti-Pattern |
-|---|---|---|
-| "Show all my applications" | `getApplicationsByCandidate(candidateId)` → Extract job IDs → STOP | ❌ Calling `getJob()` for every application without being asked |
-| "What's the status of my Senior SRE application?" | `getApplicationsByCandidate(candidateId)` → Extract `applicationId` for "Senior SRE" → `getApplicationStatus(applicationId)` | ❌ Calling `getApplicationStatus("JSeniorSRE")` by guessing ID |
-| "Show my interview schedule" | `getApplicationsByCandidate(candidateId)` → `getScheduledEvents(applicationId)` | ❌ Calling `getScheduledEvents()` without knowing `applicationId` |
+| Query Type | Correct Sequence |
+|---|---|
+| "Show all my applications with it's location details" | `getActionableApplications(talentProfileId)` → Extract job IDs → Calling `getJobDetails()` for all the actionable applications |
+| "What's the application status history of the application?" | `getActionableApplications(talentProfileId)` → Extract `applicationDocumentId`  → `getApplicationDetails(applicationDocumentId)` |
 
 **2. Stop Conditions**: Agent stops when:
 
 | Condition | Example |
 |---|---|
-| ✅ Sufficient data collected to answer query | User asks "What's my application status?" → `getApplicationStatus()` returns complete status → STOP (don't call `getNextSteps()` unless asked) |
-| ✅ Last tool call returned complete information | `getApplicationsByCandidate()` returns full list → STOP (don't call `getJob()` for each unless user asks for job details) |
-| ✅ More tool calls won't add value to answer | User asks "Am I qualified for this role?" → `getSkillsGap()` returns gap analysis → STOP (don't call `getAssessmentResults()` unless gap mentions assessments) |
-| ✅ Tool call count reaches limit (10) | Agent has called 10 tools → return helpful message asking user to rephrase |
-| ✅ Recursion limit reached (25 iterations) | Graph hits 25 iterations → hard stop with timeout error |
+| Sufficient data collected to answer query | User asks "What's my application status?" → `getApplicationStatus()` returns complete status → STOP (don't call `getAssessmentResults()` unless asked) |
+| Last tool call returned complete information | `getActionableApplications()` returns full list → STOP (don't call `getJobDetails()` for each unless user asks for job details) |
+| Tool call count reaches limit (10) | Agent has called 10 tools → return helpful message asking user to rephrase |
+| Recursion limit reached (25 iterations) | Graph hits 25 iterations → hard stop with timeout error |
 
 **3. No Speculative Calls**: Agent does NOT call tools "just in case" or "for completeness"
 
 | Anti-Pattern | Why It's Wrong | Correct Behavior |
 |---|---|---|
-| ❌ "Let me also check your assessments in case they're relevant" | Adds unnecessary latency and cost | Only call `getAssessmentResults()` if user asks about assessments OR if `getSkillsGap()` indicates missing required assessments |
-| ❌ Calling `getJob()` for all 5 applications when user asks "How many applications do I have?" | User didn't ask for job details | Answer "You have 5 applications" directly from `getApplicationsByCandidate()` |
-| ❌ Calling same tool multiple times with same parameters | Redundant, wastes resources | Use exact result from first call (or rely on session cache) |
+| "Let me also check your assessments in case they're relevant" | Adds unnecessary latency and cost | Only call `getAssessmentResults()` if user asks about assessments |
+| Calling `getJobDetails()` for all 5 applications when user asks "How many applications do I have?" | User didn't ask for job details | Answer "You have 5 applications" directly from `getActionableApplications()` |
+| Calling same tool multiple times with same parameters | Redundant, wastes resources | Use exact result from first call (or rely on session cache) |
 
 ---
 
-#### 6.6.4 System Prompt Enhancements
+#### 5.5.4 System Prompt Enhancements
 
 **Problem**: LLM lacks explicit rules on ID usage, tool calling convergence, and anti-patterns.
 
 **Solution — Strict ID Usage Rules in System Prompt**:
 
 ```python
-# File: careers-ai-service/src/agent/prompts/post_apply_assistant.py
 
 POST_APPLY_ASSISTANT_PROMPT = """
 You are post_apply_assistant, helping candidates track their job applications.
 
-## CRITICAL RULES - ID USAGE
+## CRITICAL RULES
 
 1. **NEVER guess or infer IDs from names/titles**
-   ❌ WRONG: User mentions "Senior SRE job" → You call getJob("JSeniorSRE")
-   ✅ CORRECT: Call getApplicationsByCandidate() first → Extract job_id from response → Use exact ID
+     WRONG: User mentions "Senior SRE job" → You call getJobDetails("JSeniorSRE")
+     CORRECT: Call getActionableApplications() first → Extract job_id from response → Use exact ID
 
-2. **ID Formats (USE EXACTLY AS RETURNED)**:
-   - Job IDs: J001, J002, J003 (NOT "JSeniorSRE", "job-001", "senior-sre-job")
-   - Application IDs: A001, A002, A003 (NOT "app-001", "application-1")
-   - Candidate IDs: C001, C002, C003 (Always provided in context)
+2. **Tool Calling Sequence**:
+   - To show all applications: getActionableApplications(talent_profile_id) → Extract job IDs → DONE
+   - To get job details: getActionableApplications() FIRST → Then getJobDetails(exact_job_id)
 
-3. **Tool Calling Sequence**:
-   - To show all applications: getApplicationsByCandidate(talent_profile_id) → Extract job IDs → DONE
-   - To get job details: getApplicationsByCandidate() FIRST → Then getJob(exact_job_id)
-   - To show interview schedule: getScheduledEvents(ats_application_id) → Use exact app_id
+3. **When to STOP calling tools**:
+   - You have enough information to answer the user's question
+   - Last tool call returned complete data
+   - More tool calls won't add value to the answer
+   - Don't call tools "just to check" or "for completeness"
 
-4. **When to STOP calling tools**:
-   - ✅ You have enough information to answer the user's question
-   - ✅ Last tool call returned complete data
-   - ✅ More tool calls won't add value to the answer
-   - ❌ Don't call tools "just to check" or "for completeness"
-
-5. **Answer Directly When Possible**:
-   - If user asks "show my applications" and you already called getApplicationsByCandidate() → ANSWER immediately
-   - Don't call getJob() for every application unless user specifically asks for job details
+4. **Answer Directly When Possible**:
+   - If user asks "show my applications" and you already called getActionableApplications() → ANSWER immediately
+   - Don't call getJobDetails() for every application unless user specifically asks for job details
 
 ## Response Format
 
@@ -1150,9 +781,9 @@ Always structure your response:
 Example:
 "You have 3 active applications. Here's your current status:
 
-• **Senior SRE (J001)**: Technical Interview stage - 2 interviews scheduled next week
-• **Frontend Engineer (J002)**: Offer Extended - Expires in 4 days ⚠️
-• **Data Engineer (J003)**: Rejected - Shift incompatibility
+• **Senior SRE (R-12345)**: Technical Interview stage - 2 interviews scheduled next week
+• **Frontend Engineer (R-12346)**: Offer Extended - Expires in 4 days
+• **Data Engineer (R-12347)**: Rejected - Received feedback on yyyy-mm-dd
 
 Your most urgent action: Respond to the Frontend Engineer offer by [date]."
 """
@@ -1162,53 +793,43 @@ Your most urgent action: Respond to the Frontend Engineer offer by [date]."
 
 | Anti-Pattern | Example | Why It's Prohibited |
 |---|---|---|
-| ❌ **ID Inference** | "Senior SRE" → "JSeniorSRE" | Causes `Job not found` errors, breaks tool calls |
-| ❌ **Redundant Calls** | Calling `getApplicationStatus(A001)` twice in same conversation | Wastes resources, session cache should handle this |
-| ❌ **Chain Speculation** | Calling `getJob()` without using `jobId` from previous `getApplicationsByCandidate()` result | Creates hallucinated IDs |
-| ❌ **Unbounded Loops** | Looping through all 20 applications calling `getJob()` for each | Hits tool call limit, poor UX |
-| ❌ **Speculative Completeness** | "Let me also check your assessments just in case" | Adds unnecessary latency |
+| **ID Inference** | "Senior SRE" → "seniorSre" | Causes `Job not found` errors, breaks tool calls |
+| **Redundant Calls** | Calling `getApplicationDetails(uuid)` twice in same conversation | Wastes resources, session cache should handle this |
+| **Unbounded Loops** | Looping through all 5 applications calling `getJobDetails()` for each | Hits tool call limit, poor UX |
+| **Speculative Completeness** | "Let me also check your assessments just in case" | Adds unnecessary latency |
 
 ---
 
-#### 6.6.5 Tool Schema Improvements — Before/After Examples
+#### 5.5.5 Tool Schema Improvements
 
-**Before** (leads to hallucination):
-```java
-@Tool(description = "Get application status")
-public ApplicationStatus getApplicationStatus(
-    @ToolParam(description = "Application ID") String applicationId
-) { ... }
-```
+Tools that take entity IDs as parameters include explicit format instructions in their schema descriptions. This guides the LLM to provide correctly formatted IDs and reduces hallucination.
 
-**After** (prevents hallucination):
 ```java
 @Tool(
     description = """
-    Get current status of a specific application.
+    Get current details of a specific application.
 
-    REQUIRED: ats_application_id must be an EXACT application ID (format: A###).
-    DO NOT guess. ONLY use IDs from getApplicationsByCandidate() results.
+    REQUIRED: applicationDocumentId (format: uuid).
+    DO NOT guess. ONLY use IDs from getActionableApplications() results if you have them.
 
-    Valid: A001, A002, A003
-    INVALID: app-001, application-senior-sre, A1
+    Valid: any UUIDs
+    INVALID: app-doc-1, JOB_AP_12345
     """
 )
-public ApplicationStatus getApplicationStatus(
+public ApplicationDetails getApplicationDetails(
     @ToolParam(
-        description = "Exact application ID in format A### (e.g., A001). Use value from getApplicationsByCandidate().",
+        description = "Exact application ID in format UUID (e.g., 123e4567-e89b-12d3-a456-426614174000).",
         required = true
     )
-    String applicationId
+    String applicationDocumentId
 ) {
     // Validate format before downstream call
-    if (!ats_application_id_PATTERN.matcher(applicationId).matches()) {
+    if (!applicationDocumentId_PATTERN.matcher(applicationDocumentId).matches()) {
         throw new IllegalArgumentException(
-            "Invalid ats_application_id format: '" + applicationId + "'. " +
-            "Expected format: A### (e.g., A001, A002). " +
-            "Use exact IDs from getApplicationsByCandidate() results."
+            "Invalid applicationDocumentId format: '" + applicationDocumentId + "'. " +
+            "Expected format: UUID (e.g., 123e4567-e89b-12d3-a456-426614174000). "
         );
     }
-    // ... rest of implementation
 }
 ```
 
@@ -1239,12 +860,6 @@ startup, it serialises the **projected** `AgentContext` DTO shapes — not the r
 Cosmos document shapes — to JSON Schema and exposes them as MCP static resources.
 The Python agent fetches these once at startup and embeds them into the LLM system
 prompt before any conversation begins.
-
-> **Important:** The schemas exposed as MCP resources describe what `candidate-mcp`
-> returns after PII stripping and field projection (Layer 1 output), not the full
-> Cosmos document stored in the downstream services. The LLM is deliberately grounded
-> in the projected shape only — it never sees, reasons about, or hallucinates fields
-> from the raw document.
 
 ```mermaid
 flowchart LR
@@ -1285,14 +900,16 @@ stripped (PII, internal metadata, database artefacts) are not present.
 
 | MCP Resource URI | Projected Source | Content (agent-safe fields only) |
 |---|---|---|
-| `ats://schema/candidate` | `TalentProfileV2` | Skills, experience summary, education, status enum — no raw contact details |
+| `ats://schema/profile` | `TalentProfileV2` | Assessment results, experience summary, questionnaire responses — no raw contact details |
 | `ats://schema/application` | `AtsApplication` | Stage, status enum, history, metadata — no internal fields |
+| `ats://schema/job` | `JobRequisition` | Title, location, job type, shift details — no internal fields |
+| `ats://schema/application-stages` | `ApplicationStage` | Enum of all possible application stages with descriptions — no internal fields |
 
 ---
 
-## 7. Key Data Flows
+## 6. Key Data Flows
 
-### 7.1 Agent Startup — Tool and Schema Loading
+### 6.1 Agent Startup — Tool and Schema Loading
 
 The Python application loads tools and embeds schemas once during startup, before
 serving any request.
@@ -1305,9 +922,9 @@ sequenceDiagram
 
     App->>Reg: init_registry(settings)
     Reg->>CMCP: get_tools()
-    CMCP-->>Reg: post_apply tool list (16 tools)
+    CMCP-->>Reg: post_apply tool list
     Reg->>CMCP: get_resources(schema URIs)
-    note over CMCP: Resources serialised from<br/>careers-data-schema at server startup
+    note over CMCP: Resources serialised from careers-data-schema
     CMCP-->>Reg: JSON Schema blobs
     Reg->>App: registry ready
     App->>App: build_post_apply_prompt(schemas)
@@ -1316,7 +933,7 @@ sequenceDiagram
     App->>App: serve requests
 ```
 
-### 7.2 Happy Path — Post-Apply Query
+### 6.2 Happy Path — Post-Apply Query
 
 End-to-end flow for a candidate querying their application status and next steps.
 
@@ -1329,7 +946,7 @@ sequenceDiagram
     participant CMCP as candidate-mcp
     participant CXA as cx-applications
 
-    User->>API: POST /api/v2/agent/invoke {"message": "What is the status of my application?"}
+    User->>API: POST /api/v2/agent/invoke {"message": "What is the status of my applications?"}
     API->>PA: ainvoke(AgentState)
 
     note over PA: primary_assistant_2 detects post-apply intent
@@ -1339,14 +956,14 @@ sequenceDiagram
     API->>PAA: ainvoke(AgentState)
     note over PAA: LLM selects tools, aided<br/>by embedded schema context
 
-    PAA->>CMCP: getApplicationStatus(applicationId, candidateId)\n+ X-App-Id, X-Timestamp, X-Signature
-    CMCP->>CXA: GET /v1/applications/{id}/status
-    CXA-->>CMCP: ApplicationStatusDto
+    PAA->>CMCP: getActionableApplications(talentProfileId) + WM-AUTH-SIGNATURE
+    CMCP->>CXA: GET /v2/applications?talentProfileId={talentProfileId}
+    CXA-->>CMCP: AtsApplicationDto (status, stage, history)
     CMCP-->>PAA: JSON  (fields match careers-data-schema)
 
-    PAA->>CMCP: getNextSteps(applicationId, candidateId)\n+ X-App-Id, X-Timestamp, X-Signature
-    CMCP->>CXA: GET /v1/applications/{id}/next-steps
-    CXA-->>CMCP: NextStepsDto
+    PAA->>CMCP: getJobDetails([jobIds]) + WM-AUTH-SIGNATURE
+    CMCP->>CXA: GET /v1/unified-bulk-job-details?jobIds={jobIds}
+    CXA-->>CMCP: List~JobRequisitionDto~ (title, location, job type)
     CMCP-->>PAA: JSON
 
     note over PAA: LLM synthesises empathetic<br/>response from tool outputs
@@ -1354,7 +971,7 @@ sequenceDiagram
     API-->>User: InvokeResponse {agent_used: "post_apply_assistant"}
 ```
 
-### 7.3 Profile Query Flow
+### 6.3 Profile Query Flow
 
 ```mermaid
 sequenceDiagram
@@ -1374,12 +991,12 @@ sequenceDiagram
 
     API->>PAA: ainvoke(AgentState)
 
-    PAA->>CMCP: getCandidateProfile(candidateId)
+    PAA->>CMCP: getTalentProfile(talentProfileId)
     CMCP->>TPS: GET /v1/candidates/{id}/profile
     TPS-->>CMCP: CandidateProfileDto
     CMCP-->>PAA: JSON
 
-    PAA->>CMCP: getAssessmentResults(candidateId)
+    PAA->>CMCP: getAssessmentResults(talentProfileId)
     CMCP->>TPS: GET /v1/candidates/{id}/assessments
     TPS-->>CMCP: List~AssessmentResultDto~
     CMCP-->>PAA: JSON
@@ -1388,7 +1005,7 @@ sequenceDiagram
     API-->>User: InvokeResponse
 ```
 
-### 7.4 SSE Streaming Path
+### 6.4 SSE Streaming Path
 
 ```mermaid
 sequenceDiagram
@@ -1419,7 +1036,7 @@ sequenceDiagram
     API-->>User: event: done {active_agent, tool_calls}
 ```
 
-### 7.5 Downstream Call with Resilience
+### 6.5 Downstream Call with Resilience
 
 ```mermaid
 sequenceDiagram
@@ -1432,7 +1049,7 @@ sequenceDiagram
     Tool->>CB: check state
     alt Circuit CLOSED
         CB->>Retry: execute with retry
-        Retry->>Client: getStatus(applicationId)
+        Retry->>Client: getStatus(atsRequisitionId)
         Client->>CXA: GET /v1/applications/{id}/status
         alt Success
             CXA-->>Client: 200 ApplicationStatusDto
@@ -1454,14 +1071,14 @@ sequenceDiagram
 
 ---
 
-## 8. Integration Design
+## 7. Integration Design
 
-### 8.1 MCP Protocol and TLS Handshake Optimisation
+### 7.1 MCP Protocol and TLS Handshake Optimisation
 
 `candidate-mcp` uses **stateless streamable HTTP**. This means `langchain-mcp-adapters`
 creates a new HTTP session (including a full TLS handshake) for every individual tool
 call. A typical `post_apply_assistant` workflow makes 3–5 tool calls in a single
-user request (e.g. `getApplicationsByCandidate` → `getJob` → `getApplicationStatus` →
+user request (e.g. `getActionableApplications` → `getJobDetails` → `getApplicationStatus` →
 `getNextSteps` → `getInterviewFeedback`), resulting in 3–5 consecutive TLS handshakes.
 
 Without mitigation, this adds ~50–150ms of unnecessary overhead per tool call and
@@ -1478,12 +1095,12 @@ sequenceDiagram
 
     PAA->>MCP: TCP SYN + TLS ClientHello (tool call 1)
     MCP-->>PAA: TLS ServerHello + cert + Finished
-    PAA->>MCP: getApplicationsByCandidate → result
+    PAA->>MCP: getActionableApplications → result
     note over PAA,MCP: connection closed
 
     PAA->>MCP: TCP SYN + TLS ClientHello (tool call 2)
     MCP-->>PAA: TLS ServerHello + cert + Finished
-    PAA->>MCP: getJob → result
+    PAA->>MCP: getJobDetails → result
     note over PAA,MCP: connection closed
 
     PAA->>MCP: TCP SYN + TLS ClientHello (tool call 3)
@@ -1501,7 +1118,7 @@ handshakes across tool calls within the same agent invocation.
 ```mermaid
 sequenceDiagram
     participant PAA as post_apply_assistant
-    participant POOL as httpx Connection Pool\n(shared across tool calls)
+    participant POOL as httpx Connection Pool (shared across tool calls)
     participant MCP as candidate-mcp
 
     note over PAA,MCP: One TLS handshake — subsequent calls reuse the connection
@@ -1509,11 +1126,11 @@ sequenceDiagram
     PAA->>POOL: acquire connection
     POOL->>MCP: TCP SYN + TLS ClientHello (first call only)
     MCP-->>POOL: TLS ServerHello + cert + Finished
-    POOL->>MCP: getApplicationsByCandidate → result
+    POOL->>MCP: getActionableApplications → result
     note over POOL,MCP: connection kept alive (HTTP/1.1 keep-alive or HTTP/2)
 
     PAA->>POOL: acquire connection (reused)
-    POOL->>MCP: getJob → result  (no new handshake)
+    POOL->>MCP: getJobDetails → result  (no new handshake)
 
     PAA->>POOL: acquire connection (reused)
     POOL->>MCP: getApplicationStatus → result  (no new handshake)
@@ -1550,26 +1167,26 @@ for the agent to reuse them.
 ```mermaid
 flowchart LR
     subgraph "Python Process"
-        MC["httpx.AsyncClient\n(shared · HTTP/2)\nPersistent connection pool"]
+        MC["httpx.AsyncClient (shared · HTTP/2) Persistent connection pool"]
     end
     subgraph "candidate-mcp Pod A"
-        EP_A["/mcp\n(keep-alive enabled)"]
+        EP_A["/mcp (keep-alive enabled)"]
     end
     subgraph "candidate-mcp Pod B"
-        EP_B["/mcp\n(keep-alive enabled)"]
+        EP_B["/mcp (keep-alive enabled)"]
     end
 
-    MC -->|"HTTP/2 stream 1 — tool call 1\nTLS handshake once per pod connection"| EP_A
-    MC -->|"HTTP/2 stream 2 — tool call 2\nreuses connection (no new handshake)"| EP_A
-    MC -->|"HTTP/2 stream 3 — tool call 3\nreuses connection"| EP_A
-    MC -->|"different pod — one handshake\nthen reused"| EP_B
+    MC -->|"HTTP/2 stream 1 — tool call 1 TLS handshake once per pod connection"| EP_A
+    MC -->|"HTTP/2 stream 2 — tool call 2 reuses connection (no new handshake)"| EP_A
+    MC -->|"HTTP/2 stream 3 — tool call 3 reuses connection"| EP_A
+    MC -->|"different pod — one handshake then reused"| EP_B
 ```
 
 Any pod handles any call — no sticky sessions required. Connection pool distributes
 across all healthy pods; a new handshake occurs only when a connection to a previously
 unseen pod is first established.
 
-### 8.2 Downstream Service Contracts
+### 7.2 Downstream Service Contracts
 
 `candidate-mcp` consumes three downstream services in production:
 
@@ -1577,7 +1194,7 @@ unseen pod is first established.
 
 | Tool | Endpoint |
 |---|---|
-| `getCandidateProfile` | `GET /v1/candidates/{id}/profile` |
+| `getTalentProfile` | `GET /v1/candidates/{id}/profile` |
 | `getSkillsGap` | `GET /v1/candidates/{id}/skills-gap?jobId={jobId}` |
 | `getAssessmentResults` | `GET /v1/candidates/{id}/assessments` |
 | `getAssessmentByType` | `GET /v1/candidates/{id}/assessments?type={type}` |
@@ -1588,7 +1205,7 @@ unseen pod is first established.
 | Tool | Endpoint |
 |---|---|
 | `getApplicationStatus` | `GET /v1/applications/{id}/status` |
-| `getApplicationsByCandidate` | `GET /v1/applications?candidateId={id}` |
+| `getActionableApplications` | `GET /v1/applications?talentProfileId={id}` |
 | `getCandidateJourney` | `GET /v1/candidates/{id}/journey` |
 | `getNextSteps` | `GET /v1/applications/{id}/next-steps` |
 | `getStageDuration` | `GET /v1/applications/{id}/stage-duration` |
@@ -1598,7 +1215,7 @@ unseen pod is first established.
 
 | Tool | Endpoint |
 |---|---|
-| `getJob` | `GET /v1/jobs/{id}` — returns title, location, department, job type, required assessment codes, and requisition status |
+| `getJobDetails` | `GET /v1/jobs/{id}` — returns title, location, department, job type, required assessment codes, and requisition status |
 
 > `job-sync-service` is an existing service. `candidate-mcp` calls it via a new
 > `JobSyncClient` (WebClient + circuit breaker). The v1 primary assistant's existing
@@ -1606,14 +1223,14 @@ unseen pod is first established.
 
 ---
 
-## 9. Security Design
+## 8. Security Design
 
 All service-to-service authentication uses **App2App HMAC-SHA256 signature auth**.
 The same mechanism applies to both hops:
 `careers-ai-service` → `candidate-mcp` and `candidate-mcp` → downstream services.
 Each hop uses independently registered app IDs and shared secrets.
 
-### 9.1 App2App Signature Auth — careers-ai-service to candidate-mcp
+### 8.1 App2App Signature Auth — careers-ai-service to candidate-mcp
 
 Trust is established via an HMAC-SHA256 request signature computed by the caller
 and validated by the receiver.
@@ -1632,12 +1249,12 @@ Each MCP request from `careers-ai-service` carries three additional HTTP headers
 
 ```mermaid
 sequenceDiagram
-    participant Agent as careers-ai-service\n(SignatureProvider)
-    participant MCP as candidate-mcp\n(SignatureFilter)
-    participant SR as ServiceRegistry\n(in-memory / Redis)
+    participant Agent as careers-ai-service (SignatureProvider)
+    participant MCP as candidate-mcp (SignatureFilter)
+    participant SR as ServiceRegistry (in-memory / Redis)
 
-    Agent->>Agent: compute signature\n(app_id + timestamp + path)
-    Agent->>MCP: POST /mcp\n+ X-App-Id, X-Timestamp, X-Signature
+    Agent->>Agent: compute signature (app_id + timestamp + path)
+    Agent->>MCP: POST /mcp + X-App-Id, X-Timestamp, X-Signature
 
     MCP->>SR: lookup(app_id) → secret + ttl_seconds
     SR-->>MCP: shared_secret, ttl=300
@@ -1668,8 +1285,8 @@ its shared secret and optional TTL override. The default TTL is 5 minutes.
 
 ```mermaid
 flowchart LR
-    SR["Service Registry\n────────────────────\napp_id → secret + ttl\nstored in application.yml\nor external config (Vault / K8s Secret)"]
-    SF["SignatureFilter\n(Spring OncePerRequestFilter)"]
+    SR["Service Registry ──────────────────── app_id → secret + ttl stored in application.yml or external config (Vault / K8s Secret)"]
+    SF["SignatureFilter (Spring OncePerRequestFilter)"]
     REQ["Inbound MCP request"]
 
     REQ --> SF
@@ -1686,9 +1303,9 @@ provider reads `APP_ID` and `APP_SECRET` from the environment.
 
 ```mermaid
 flowchart LR
-    PAA["post_apply_assistant\ntool call"]
-    SP["SignatureProvider\n────────────────────\nreads APP_ID, APP_SECRET\ncomputes HMAC-SHA256\ninjects X-* headers"]
-    MC["MultiServerMCPClient\n(httpx transport)"]
+    PAA["post_apply_assistant tool call"]
+    SP["SignatureProvider ──────────────────── reads APP_ID, APP_SECRET computes HMAC-SHA256 injects X-* headers"]
+    MC["MultiServerMCPClient (httpx transport)"]
     CMCP["candidate-mcp /mcp"]
 
     PAA --> SP
@@ -1698,7 +1315,7 @@ flowchart LR
 
 ---
 
-### 9.2 App2App Signature Auth — candidate-mcp to Downstream Services
+### 8.2 App2App Signature Auth — candidate-mcp to Downstream Services
 
 `candidate-mcp` uses the same HMAC-SHA256 signature scheme when calling downstream
 services. Each downstream service registers `candidate-mcp` as a trusted `app_id`
@@ -1708,16 +1325,16 @@ injects `X-App-Id`, `X-Timestamp`, and `X-Signature` on every outbound REST call
 ```mermaid
 flowchart LR
     subgraph "candidate-mcp"
-        SP["SignatureProvider\ncomputes HMAC-SHA256\ninjects X-* headers"]
+        SP["SignatureProvider computes HMAC-SHA256 injects X-* headers"]
         PT["ProfileTools"]
         AT["ApplicationTools"]
         JT["JobTools"]
         PT & AT & JT --> SP
     end
 
-    TPS["talent-profile-service\n(validates X-App-Id/Signature)"]
-    CXA["cx-applications\n(validates X-App-Id/Signature)"]
-    JSS["job-sync-service\n(validates X-App-Id/Signature)"]
+    TPS["talent-profile-service (validates X-App-Id/Signature)"]
+    CXA["cx-applications (validates X-App-Id/Signature)"]
+    JSS["job-sync-service (validates X-App-Id/Signature)"]
 
     SP -->|"REST + App2App Signature"| TPS
     SP -->|"REST + App2App Signature"| CXA
@@ -1726,7 +1343,7 @@ flowchart LR
 
 ---
 
-### 9.3 Security Principles
+### 8.3 Security Principles
 
 | Principle | Implementation |
 |---|---|
@@ -1739,9 +1356,9 @@ flowchart LR
 
 ---
 
-## 10. Resilience Design
+## 9. Resilience Design
 
-### 10.1 Circuit Breaker — State Machine
+### 9.1 Circuit Breaker — State Machine
 
 One circuit breaker per downstream service, independently tripped. A failure in
 `cx-applications` does not affect `talent-profile-service` or `job-sync-service`
@@ -1750,13 +1367,13 @@ calls. Three circuit breakers in total: one per service.
 ```mermaid
 stateDiagram-v2
     [*] --> Closed
-    Closed --> Open : failure rate ≥ 50%\nacross 20-call sliding window
+    Closed --> Open : failure rate ≥ 50% across 20-call sliding window
     Open --> HalfOpen : after 30 seconds
     HalfOpen --> Closed : 5 probe calls succeed
     HalfOpen --> Open : any probe call fails
 ```
 
-### 10.2 Retry Configuration
+### 9.2 Retry Configuration
 
 | Parameter | Value | Applies To |
 |---|---|---|
@@ -1765,7 +1382,7 @@ stateDiagram-v2
 | Retry on | 5xx, connection timeout | Network / server errors |
 | Do not retry | 4xx | Client errors (not found, access denied) |
 
-### 10.3 Timeout Hierarchy
+### 9.3 Timeout Hierarchy
 
 | Layer | Timeout | Purpose |
 |---|---|---|
@@ -1773,7 +1390,7 @@ stateDiagram-v2
 | WebClient response | 5s | Per downstream HTTP call |
 | WebClient connect | 2s | TCP connection establishment |
 
-### 10.4 Graceful Degradation
+### 9.4 Graceful Degradation
 
 When a circuit is open or all retries are exhausted, every tool handler returns a
 structured error JSON rather than throwing an exception. The LLM reads this and
@@ -1782,7 +1399,7 @@ hallucinating data or producing an error trace.
 
 ---
 
-## 11. Observability Design
+## 10. Observability Design
 
 Production observability uses a **three-layer stack**:
 
@@ -1795,25 +1412,25 @@ implementation implementation and production deployment planning.
 
 ---
 
-### 11.1 Three-Layer Observability Stack
+### 10.1 Three-Layer Observability Stack
 
 ```mermaid
 flowchart TD
     subgraph "Layer 1: LLM Observability"
-        LF["Langfuse\n────────────────────\n• Trace every LLM call\n• Track token usage & cost\n• Session tracking\n• User feedback collection\n• Prompt versioning"]
+        LF["Langfuse ──────────────────── • Trace every LLM call • Track token usage & cost • Session tracking • User feedback collection • Prompt versioning"]
     end
 
     subgraph "Layer 2: Service Metrics"
-        PROM["Prometheus\n────────────────────\n• Request rates\n• Latency P50/P95/P99\n• Tool call metrics\n• Circuit breaker state\n• SLO tracking"]
+        PROM["Prometheus ──────────────────── • Request rates • Latency P50/P95/P99 • Tool call metrics • Circuit breaker state • SLO tracking"]
     end
 
     subgraph "Layer 3: Application Logs"
-        OO["OpenObserve\n────────────────────\n• Structured logs\n• Strategic log events\n• Alert rules\n• Production dashboards"]
+        OO["OpenObserve ──────────────────── • Structured logs • Strategic log events • Alert rules • Production dashboards"]
     end
 
     subgraph "Services"
-        PA["careers-ai-service\n(Python)"]
-        MC["candidate-mcp\n(Java)"]
+        PA["careers-ai-service (Python)"]
+        MC["candidate-mcp (Java)"]
     end
 
     PA -->|"LangfuseCallbackHandler"| LF
@@ -1825,7 +1442,7 @@ flowchart TD
 
 ---
 
-### 11.2 Langfuse: LLM Tracing & Cost Management
+### 10.2 Langfuse: LLM Tracing & Cost Management
 
 #### A. Enhanced Trace Configuration
 
@@ -1833,7 +1450,7 @@ flowchart TD
 
 - **Session tracking** via `thread_id` (multi-turn conversation grouping)
 - **User segmentation** via `talent_profile_id` (per-candidate metrics)
-- **Rich metadata**: agent version, environment, ats_application_id context
+- **Rich metadata**: agent version, environment, ats_requisition_id context
 - **Tags**: `production`, `post_apply_assistant`, `application_specific`
 
 **Implementation**:
@@ -1848,7 +1465,7 @@ langfuse_handler = CallbackHandler(
         "agent_version": "v2.0",
         "environment": "production",
         "talent_profile_id": talent_profile_id,
-        "ats_application_id": ats_application_id,
+        "ats_requisition_id": ats_requisition_id,
     }
 )
 
@@ -1916,7 +1533,7 @@ async def submit_feedback(trace_id: str, score: float, comment: str | None = Non
 
 ---
 
-### 11.3 Prometheus: Service Metrics & SLOs
+### 10.3 Prometheus: Service Metrics & SLOs
 
 #### A. Python Agent Metrics (careers-ai-service)
 
@@ -2130,14 +1747,14 @@ groups:
 
 ---
 
-### 11.4 OpenObserve: Application Logs & Alerting
+### 10.4 OpenObserve: Application Logs & Alerting
 
 #### A. Strategic Logging Points — Python Agent
 
 | Event | Level | Fields | Alert Trigger |
 |---|---|---|---|
 | `agent_invoke_start` | INFO | `thread_id`, `correlation_id`, `talent_profile_id`, `message` | - |
-| `handoff_to_post_apply_assistant` | INFO | `reason`, `talent_profile_id`, `ats_application_id` | - |
+| `handoff_to_post_apply_assistant` | INFO | `reason`, `talent_profile_id`, `ats_requisition_id` | - |
 | `mcp_tool_call_start` | DEBUG | `tool_name`, `args`, `correlation_id` | - |
 | `mcp_tool_call_complete` | INFO | `tool_name`, `duration_ms`, `status` | If `duration_ms > 5000` |
 | `mcp_tool_call_error` | ERROR | `tool_name`, `error`, `correlation_id` | Immediate |
@@ -2155,11 +1772,11 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 # Example: Log tool call with timing
-with tool_call_span("getCandidateProfile", {"candidateId": "C001"}):
+with tool_call_span("getTalentProfile", {"talentProfileId": "C001"}):
     result = await tool.ainvoke(args)
     logger.info(
         "mcp_tool_call_complete",
-        tool_name="getCandidateProfile",
+        tool_name="getTalentProfile",
         duration_ms=duration_ms,
         status="success"
     )
@@ -2177,7 +1794,7 @@ with tool_call_span("getCandidateProfile", {"candidateId": "C001"}):
 | `downstream_call_complete` | INFO | `service`, `endpoint`, `status_code`, `duration_ms` | If `status_code >= 500` |
 | `downstream_call_error` | ERROR | `service`, `endpoint`, `error`, `retry_attempt` | If 3+ failures in 5 min |
 | `circuit_breaker_opened` | CRITICAL | `service`, `failure_rate`, `call_count` | Immediate |
-| `sla_breach_detected` | WARN | `ats_application_id`, `stage`, `days_in_stage`, `threshold` | If count > 10 in 1 hour |
+| `sla_breach_detected` | WARN | `ats_requisition_id`, `stage`, `days_in_stage`, `threshold` | If count > 10 in 1 hour |
 | `mcp_request_received` | INFO | `x_correlation_id`, `x_talent_profile_id`, `method` | - |
 | `mcp_response_sent` | INFO | `x_correlation_id`, `status`, `duration_ms` | If `duration_ms > 10000` |
 
@@ -2187,7 +1804,7 @@ import org.slf4j.Logger;
 import org.slf4j.MDC;
 
 MDC.put("tool", toolName);
-MDC.put("talent_profile_id", candidateId);
+MDC.put("talent_profile_id", talentProfileId);
 MDC.put("trace_id", traceId);
 log.info("tool_called args_hash={}", hashArgs(args));
 MDC.clear();
@@ -2263,21 +1880,21 @@ Panels:
 
 ---
 
-### 11.5 Distributed Trace Propagation
+### 10.5 Distributed Trace Propagation
 
 ```mermaid
 flowchart LR
-    CL["Client\n(trace ID generated)"]
-    PY["Python Agent\n(FastAPI + OTel)"]
-    MC["MCP HTTP call\n(httpx instrumented)"]
-    JV["candidate-mcp\n(Micrometer + OTel)"]
+    CL["Client (trace ID generated)"]
+    PY["Python Agent (FastAPI + OTel)"]
+    MC["MCP HTTP call (httpx instrumented)"]
+    JV["candidate-mcp (Micrometer + OTel)"]
     DS["Downstream Service"]
-    COLL[("OTLP Collector\n→ Jaeger / Tempo")]
+    COLL[("OTLP Collector → Jaeger / Tempo")]
 
     CL -->|"traceparent"| PY
-    PY -->|"traceparent injected\nby httpx"| MC
+    PY -->|"traceparent injected by httpx"| MC
     MC --> JV
-    JV -->|"traceparent injected\nby WebClient"| DS
+    JV -->|"traceparent injected by WebClient"| DS
     PY -.->|"spans"| COLL
     JV -.->|"spans"| COLL
 ```
@@ -2288,7 +1905,7 @@ included in every structured log record throughout the Python process. The W3C
 
 ---
 
-### 11.6 Implementation Roadmap
+### 10.6 Implementation Roadmap
 
 **Phase 1: Foundation (Week 1)**
 - ✅ Basic Langfuse integration (already done)
@@ -2316,7 +1933,7 @@ included in every structured log record throughout the Python process. The W3C
 
 ---
 
-## 12. Caching Design
+## 11. Caching Design
 
 The production `careers-ai-service` service already operates a Redis cluster shared
 across all worker processes and pods. The v2 primary assistant flow uses this same
@@ -2332,26 +1949,26 @@ flowchart LR
     end
 
     subgraph "Shared Redis Cluster"
-        NS1["mcp:schema:*\nStatic resource schemas"]
-        NS2["langgraph:checkpoint:*\nThread conversation state"]
-        NS3["agent:tool:*\nWithin-session tool cache"]
+        NS1["mcp:schema:* Static resource schemas"]
+        NS2["langgraph:checkpoint:* Thread conversation state"]
+        NS3["agent:tool:* Within-session tool cache"]
     end
 
     subgraph "candidate-mcp"
-        NS4["cmcp:tool:*\nTool response cache"]
-        SR["Static Resources\n(source of truth)"]
+        NS4["cmcp:tool:* Tool response cache"]
+        SR["Static Resources (source of truth)"]
     end
 
     W1 & W2 & WN <-->|"read / write"| NS1
     W1 & W2 & WN <-->|"read / write"| NS2
     W1 & W2 & WN <-->|"read / write"| NS3
-    W1 & W2 & WN -->|"MCP tool call\n(if agent:tool miss)"| NS4
-    SR -.->|"fetched once\nthen cached in mcp:schema"| W1
+    W1 & W2 & WN -->|"MCP tool call (if agent:tool miss)"| NS4
+    SR -.->|"fetched once then cached in mcp:schema"| W1
 ```
 
 ---
 
-### 12.1 MCP Static Resource Schema Cache — careers-ai-service side
+### 11.1 MCP Static Resource Schema Cache — careers-ai-service side
 
 **Problem:** `candidate-mcp` exposes 4–5 static JSON Schema resources
 (`ats://schema/*`). The Python agent fetches these during `init_registry()` at
@@ -2407,7 +2024,7 @@ receives at most **one schema fetch per deployment** rather than one per worker.
 
 ---
 
-### 12.2 LangGraph Thread State — Conversation Checkpointer
+### 11.2 LangGraph Thread State — Conversation Checkpointer
 
 **Problem:** The current v1 and v2 graphs use `MemorySaver` — an in-process
 Python dictionary. With 8 workers per pod and multiple pods, any turn of a
@@ -2449,11 +2066,11 @@ sequenceDiagram
 
 ---
 
-### 12.3 Within-Session Tool Response Cache — careers-ai-service side
+### 11.3 Within-Session Tool Response Cache — careers-ai-service side
 
 **Problem:** Within a single multi-turn conversation, the candidate may ask several
 related questions. Each question may trigger the same MCP tool call with the same
-arguments (e.g. `getCandidateProfile` called on turn 1, turn 3, and turn 5 of the
+arguments (e.g. `getTalentProfile` called on turn 1, turn 3, and turn 5 of the
 same session). Each call incurs an MCP HTTP round-trip.
 
 **Solution — short-TTL per-session tool response cache:**
@@ -2465,9 +2082,9 @@ hitting `candidate-mcp`.
 
 ```mermaid
 flowchart TD
-    PAA["post_apply_assistant\ntool call: getCandidateProfile(C001)"]
-    AC{{"Redis\nagent:tool:getCandidateProfile:C001\n(session-scoped · short TTL)"}}
-    CMCP["candidate-mcp\n(HTTP + TLS + downstream call)"]
+    PAA["post_apply_assistant tool call: getTalentProfile(C001)"]
+    AC{{"Redis agent:tool:getTalentProfile:C001 (session-scoped · short TTL)"}}
+    CMCP["candidate-mcp (HTTP + TLS + downstream call)"]
 
     PAA -->|"lookup"| AC
     AC -->|"HIT (< 5 min old)"| PAA
@@ -2478,14 +2095,14 @@ flowchart TD
 
 | Tool | Agent-side cache TTL | Notes |
 |---|---|---|
-| `getCandidateProfile` | 5 min | Profile stable within a session |
-| `getSkillsGap` | 5 min | Keyed by candidateId + jobId |
-| `getJob` | 10 min | Job data changes rarely; same job enriched across multiple applications |
+| `getTalentProfile` | 5 min | Profile stable within a session |
+| `getSkillsGap` | 5 min | Keyed by talentProfileId + jobId |
+| `getJobDetails` | 10 min | Job data changes rarely; same job enriched across multiple applications |
 | `getAssessmentResults` | 5 min | Assessment results don't change mid-session |
 | `getAssessmentByType` | 5 min | Subset of above |
 | `compareToPercentile` | 10 min | Pool percentiles update daily |
 | `getApplicationStatus` | Not cached | Live status — must always be fresh |
-| `getApplicationsByCandidate` | Not cached | New applications could arrive |
+| `getActionableApplications` | Not cached | New applications could arrive |
 | `getCandidateJourney` | Not cached | Stage transitions are live |
 | `getNextSteps` | Not cached | Stage-dependent, must reflect current status |
 | `getStageDuration` | Not cached | Increments daily |
@@ -2496,7 +2113,7 @@ is a SHA-256 of the serialised tool arguments. TTL resets on every read (sliding
 
 ---
 
-### 12.4 Tool Response Cache — candidate-mcp side
+### 11.4 Tool Response Cache — candidate-mcp side
 
 `candidate-mcp` maintains its own Redis cache for calls to downstream services. This
 is **separate from and independent of** the agent-side cache in 12.3. The two caches
@@ -2506,10 +2123,10 @@ callers; the agent-side cache reduces MCP round-trips within a session.
 ```mermaid
 flowchart LR
     subgraph "careers-ai-service process"
-        PAA_CACHE["agent:tool:* (12.3)\nPrevents repeat MCP HTTP calls\nwithin one session"]
+        PAA_CACHE["agent:tool:* (12.3) Prevents repeat MCP HTTP calls within one session"]
     end
     subgraph "candidate-mcp"
-        MCP_CACHE["cmcp:tool:* (12.4)\nPrevents repeat downstream\nREST calls across all callers"]
+        MCP_CACHE["cmcp:tool:* (12.4) Prevents repeat downstream REST calls across all callers"]
     end
     subgraph "Downstream"
         TPS["talent-profile-service"]
@@ -2523,14 +2140,14 @@ flowchart LR
 
 | Tool | candidate-mcp cache TTL | Invalidation |
 |---|---|---|
-| `getCandidateProfile` | 5 min | Profile update event (event-driven invalidation) |
+| `getTalentProfile` | 5 min | Profile update event (event-driven invalidation) |
 | `getAssessmentResults` | 5 min | Assessment completion event |
 | `getAssessmentByType` | 5 min | TTL only |
 | `compareToPercentile` | 10 min | TTL only (pool updates daily) |
 | `getSkillsGap` | 5 min | Profile update event |
-| `getJob` | 15 min | Job update event |
+| `getJobDetails` | 15 min | Job update event |
 | `getApplicationStatus` | Not cached | Live status |
-| `getApplicationsByCandidate` | Not cached | New applications may arrive |
+| `getActionableApplications` | Not cached | New applications may arrive |
 | `getCandidateJourney` | Not cached | Stage transitions are live |
 | `getNextSteps` | Not cached | Stage-dependent |
 | `getStageDuration` | Not cached | Updates daily |
@@ -2538,7 +2155,7 @@ flowchart LR
 
 ---
 
-### 12.5 Cache Hierarchy Summary
+### 11.5 Cache Hierarchy Summary
 
 | Cache | Owner | Redis namespace | What it prevents |
 |---|---|---|---|
@@ -2549,9 +2166,9 @@ flowchart LR
 
 ---
 
-## 13. Error Handling
+## 12. Error Handling
 
-### 13.1 Error Envelope Contract
+### 12.1 Error Envelope Contract
 
 Every MCP tool returns a JSON string. On failure, a typed error envelope is returned
 so the LLM can interpret it and generate a helpful user-facing message.
@@ -2562,7 +2179,7 @@ so the LLM can interpret it and generate a helpful user-facing message.
 | `message` | Human-readable description safe to surface |
 | `retriable` | Whether the caller should suggest trying again |
 
-### 13.2 Error Classification
+### 12.2 Error Classification
 
 | Scenario | Error Code | HTTP Status | Retriable | Example Response |
 |---|---|---|---|---|
@@ -2571,7 +2188,7 @@ so the LLM can interpret it and generate a helpful user-facing message.
 | Service timeout | `service_timeout` | 504 | Yes | `{"error": "service_timeout", "message": "Request timed out"}` |
 | Circuit breaker open | `service_unavailable` | 503 | Yes | `{"error": "service_unavailable", "message": "Service temporarily unavailable"}` |
 | Unexpected error | `internal_error` | 500 | No | `{"error": "internal_error", "message": "An unexpected error occurred"}` |
-| **Invalid ID format** (NEW) | `invalid_id_format` | 400 | No | `{"error": "invalid_id_format", "message": "Invalid job_id format: 'JSeniorSRE'. Expected format: J### (e.g., J001). Use exact IDs from getApplicationsByCandidate()."}` |
+| **Invalid ID format** (NEW) | `invalid_id_format` | 400 | No | `{"error": "invalid_id_format", "message": "Invalid job_id format: 'JSeniorSRE'. Expected format: J### (e.g., J001). Use exact IDs from getActionableApplications()."}` |
 | **Recursion limit exceeded** (NEW) | `recursion_limit_exceeded` | 504 | No | `{"error": "recursion_limit_exceeded", "message": "Request exceeded maximum iteration limit (25). Please simplify your query."}` |
 | **Request timeout** (NEW) | `request_timeout` | 504 | No | `{"error": "request_timeout", "message": "Agent execution timeout. Please try a simpler query or contact support."}` |
 
@@ -2581,7 +2198,7 @@ so the LLM can interpret it and generate a helpful user-facing message.
 # Invalid ID format error (400 Bad Request)
 {
     "error": "invalid_id_format",
-    "message": "Invalid job_id format: 'JSeniorSRE'. Expected format: J### (e.g., J001, J002). Do not guess job IDs. Use exact IDs from getApplicationsByCandidate() results.",
+    "message": "Invalid job_id format: 'JSeniorSRE'. Expected format: J### (e.g., J001, J002). Do not guess job IDs. Use exact IDs from getActionableApplications() results.",
     "retriable": false,
     "details": {
         "provided_id": "JSeniorSRE",
@@ -2619,17 +2236,17 @@ in the error envelope.
 
 ---
 
-## 14. Testing Strategy
+## 13. Testing Strategy
 
-### 14.1 Test Layers
+### 13.1 Test Layers
 
 ```mermaid
 flowchart TB
-    E2E["End-to-End Tests\n──────────────────────\nPython pytest · live stack\nFull conversation scenarios"]
-    INT_PY["Python Integration Tests\n──────────────────────\nASGI client + real candidate-mcp\nLifespan-managed fixture"]
-    INT_JAVA["Java Integration Tests\n──────────────────────\nSpring Boot Test + WireMock\nDownstream services stubbed"]
-    CONTRACT["Contract Tests  Pact\n──────────────────────\ncandidate-mcp as consumer\ncx-apps and talent-profile as providers\nPublished to Pact Broker"]
-    UNIT["Unit Tests\n──────────────────────\nTool handlers: JSON shape\nError paths: 4xx · 5xx · circuit open\nToken provider: refresh boundary"]
+    E2E["End-to-End Tests ────────────────────── Python pytest · live stack Full conversation scenarios"]
+    INT_PY["Python Integration Tests ────────────────────── ASGI client + real candidate-mcp Lifespan-managed fixture"]
+    INT_JAVA["Java Integration Tests ────────────────────── Spring Boot Test + WireMock Downstream services stubbed"]
+    CONTRACT["Contract Tests  Pact ────────────────────── candidate-mcp as consumer cx-apps and talent-profile as providers Published to Pact Broker"]
+    UNIT["Unit Tests ────────────────────── Tool handlers: JSON shape Error paths: 4xx · 5xx · circuit open Token provider: refresh boundary"]
 
     E2E --> INT_PY
     INT_PY --> INT_JAVA
@@ -2637,7 +2254,7 @@ flowchart TB
     CONTRACT --> UNIT
 ```
 
-### 14.2 Key Scenarios by Layer
+### 13.2 Key Scenarios by Layer
 
 **Unit (Java — candidate-mcp tool handlers)**
 - Nominal: correct JSON shape matching `careers-data-schema` DTO fields.
@@ -2674,13 +2291,13 @@ Scenarios covered:
 
 | # | Group | Candidate / Application | Scenario |
 |---|---|---|---|
-| 1 | Profile | C002 | Profile — no ats_application_id → `getCandidateProfile` |
+| 1 | Profile | C002 | Profile — no ats_requisition_id → `getTalentProfile` |
 | 2 | Profile | C001 / J002 | Skills gap vs unapplied role → `getSkillsGap` |
 | 3 | Application Status | C001 / A001 | FINAL_INTERVIEW status → `getApplicationStatus` |
 | 4 | Application Status | C004 / A004 | OFFER_EXTENDED — offer surfaced |
 | 5 | Application Status | C001 / A006 | REJECTED — constructive tone |
-| 6 | All Applications | C001 | Full history without ats_application_id → `getApplicationsByCandidate` |
-| 7 | All Applications | C006 | Journey narrative without ats_application_id |
+| 6 | All Applications | C001 | Full history without ats_requisition_id → `getActionableApplications` |
+| 7 | All Applications | C006 | Journey narrative without ats_requisition_id |
 | 8 | Assessments | C004 / A004 | All 3 assessments (97–98th percentile) → `getAssessmentResults` |
 | 9 | Assessments | C002 / A002 | Percentile comparison (94th) → `compareToPercentile` |
 | 10 | Next Steps | C002 / A002 | PHONE_INTERVIEW prep → `getNextSteps` |
@@ -2715,15 +2332,15 @@ def test_recursion_limit_prevents_infinite_loop(client: TestClient):
 
 def test_invalid_job_id_format_rejected(client: TestClient):
     """Test that hallucinated job IDs are rejected"""
-    # Simulate agent trying to call getJob with invalid ID
+    # Simulate agent trying to call getJobDetails with invalid ID
     with pytest.raises(ValueError, match="Invalid job_id format"):
-        job_tools.getJob("JSeniorSRE")  # Should fail validation
+        job_tools.getJobDetails("JSeniorSRE")  # Should fail validation
 
     with pytest.raises(ValueError, match="Invalid job_id format"):
-        job_tools.getJob("job-001")  # Should fail validation
+        job_tools.getJobDetails("job-001")  # Should fail validation
 
     # Valid ID should pass
-    result = job_tools.getJob("J001")
+    result = job_tools.getJobDetails("J001")
     assert result is not None
 
 def test_request_timeout_enforced(client: TestClient):
@@ -2759,7 +2376,7 @@ def test_tool_call_limit_enforced(client: TestClient):
 def test_id_validation_error_message_helpful(client: TestClient):
     """Test that ID validation errors provide helpful guidance"""
     try:
-        job_tools.getJob("JSeniorSRE")
+        job_tools.getJobDetails("JSeniorSRE")
         pytest.fail("Should have raised error")
     except ValueError as e:
         error_msg = str(e)
@@ -2767,7 +2384,7 @@ def test_id_validation_error_message_helpful(client: TestClient):
         assert "Invalid job_id format" in error_msg
         assert "J###" in error_msg  # Expected format
         assert "J001" in error_msg  # Valid example
-        assert "getApplicationsByCandidate" in error_msg  # Correct approach
+        assert "getActionableApplications" in error_msg  # Correct approach
 ```
 
 **Test Coverage Requirements**:
@@ -2781,26 +2398,26 @@ def test_id_validation_error_message_helpful(client: TestClient):
 | **Convergence patterns** | Sequential tool calls | ✅ Agent stops after sufficient data collected |
 
 **End-to-End**
-- Candidate asks for application status → `agent_used: post_apply_assistant`, response references applicationId.
-- Candidate asks for skills gap against a role → `getCandidateProfile` and `getSkillsGap` both called.
+- Candidate asks for application status → `agent_used: post_apply_assistant`, response references atsRequisitionId.
+- Candidate asks for skills gap against a role → `getTalentProfile` and `getSkillsGap` both called.
 - `cx-applications` unavailable → user receives a degraded but helpful response.
 - Existing job search query → still routed to existing job search assistant, untouched.
 
 ---
 
-## 15. Deployment
+## 14. Deployment
 
-### 15.1 Service Topology
+### 14.1 Service Topology
 
 ```mermaid
 flowchart TD
     subgraph "Kubernetes Cluster"
         subgraph "Agent Namespace"
-            AGT["careers-agent\nPython · Uvicorn\nreplicas: 2"]
+            AGT["careers-agent Python · Uvicorn replicas: 2"]
         end
 
         subgraph "MCP Namespace"
-            CMCP["candidate-mcp\nJava · Spring AI\nreplicas: 2"]
+            CMCP["candidate-mcp Java · Spring AI replicas: 2"]
         end
 
         subgraph "Infrastructure"
@@ -2823,7 +2440,7 @@ flowchart TD
 
 ```
 
-### 15.2 Health Checks
+### 14.2 Health Checks
 
 | Service | Liveness Probe | Readiness Probe |
 |---|---|---|
@@ -2834,7 +2451,7 @@ The readiness probe on `candidate-mcp` returns unhealthy if any circuit breaker 
 the `OPEN` state, removing the pod from the load balancer until the downstream service
 recovers.
 
-### 15.3 Configuration Injection
+### 14.3 Configuration Injection
 
 | Config Type | Mechanism |
 |---|---|
@@ -2845,7 +2462,7 @@ recovers.
 
 ---
 
-## 16. Design Decisions
+## 15. Design Decisions
 
 ### DD-01: Three-Layer Transformation — Separation of PII Safety, Context Relevance, and Presentation
 
@@ -3048,12 +2665,12 @@ given startup only happens on deployment.
 
 **Consequence:** A full outage of one service degrades only the tools that depend on
 it. Profile and assessment tools remain functional if `cx-applications` is down.
-`getJob` enrichment degrades gracefully if `job-sync-service` is unavailable — the
+`getJobDetails` enrichment degrades gracefully if `job-sync-service` is unavailable — the
 assistant can still answer application status queries without job details.
 
 ---
 
-## 17. Open Issues & Risks
+## 16. Open Issues & Risks
 
 | ID | Issue / Risk | Severity | Owner | Status |
 |---|---|---|---|---|
