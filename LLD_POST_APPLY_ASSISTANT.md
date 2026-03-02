@@ -80,6 +80,7 @@
     14.3 [Configuration Injection](#143-configuration-injection)
 15. [Design Decisions](#15-design-decisions)
 16. [Open Issues & Risks](#16-open-issues--risks)
+17. [JIRA Stories](#17-jira-stories)
 
 ---
 
